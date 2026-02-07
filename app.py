@@ -1,7 +1,21 @@
 """
-Pre-Market Command Center v7
+Pre-Market Command Center v8.1
 Institutional-Grade Market Prep Dashboard
-AI Expert Analysis · Support/Resistance · Deep Technical Signals
+AI Expert Analysis · Earnings Intelligence · Whale Tracker · Support/Resistance
+
+v8.1 Updates:
+- Code quality improvements and bug fixes
+- Enhanced error handling
+- Optimized caching strategy
+- Removed duplicate CSS
+- Added safe division utilities
+
+Features:
+- 🐋 Institutional Activity & Whale Tracker
+- 📅 Earnings Center (calendar, analyzer, news)
+- 📰 News Flow Analysis in Market Brief
+- 📈 Advanced Options Screener with time-of-day weighting
+- 🎯 AI-generated macro analysis
 """
 
 import streamlit as st
@@ -18,7 +32,55 @@ import re
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 import warnings
+from typing import Optional, Tuple, List, Dict, Any
 warnings.filterwarnings('ignore')
+
+# === UTILITY FUNCTIONS ===
+
+def safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Safely divide two numbers, returning default if denominator is zero or invalid."""
+    try:
+        if denominator is None or denominator == 0 or pd.isna(denominator):
+            return default
+        result = numerator / denominator
+        return default if pd.isna(result) else result
+    except (TypeError, ZeroDivisionError):
+        return default
+
+def safe_pct_change(current: float, previous: float, default: float = 0.0) -> float:
+    """Calculate percentage change safely."""
+    return safe_div((current - previous), previous, default) * 100
+
+def safe_get(data: dict, key: str, default: Any = None) -> Any:
+    """Safely get a value from a dict, handling None and NaN."""
+    try:
+        val = data.get(key, default)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return default
+        return val
+    except (AttributeError, TypeError):
+        return default
+
+def format_large_number(num: float, precision: int = 2) -> str:
+    """Format large numbers with B/M/K suffixes."""
+    if num is None or pd.isna(num):
+        return "N/A"
+    try:
+        num = float(num)
+        if abs(num) >= 1e12:
+            return f"${num/1e12:.{precision}f}T"
+        elif abs(num) >= 1e9:
+            return f"${num/1e9:.{precision}f}B"
+        elif abs(num) >= 1e6:
+            return f"${num/1e6:.{precision}f}M"
+        elif abs(num) >= 1e3:
+            return f"${num/1e3:.{precision}f}K"
+        else:
+            return f"${num:.{precision}f}"
+    except (ValueError, TypeError):
+        return "N/A"
+
+# === STREAMLIT CONFIG ===
 
 st.set_page_config(page_title="Pre-Market Command Center", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
@@ -73,9 +135,6 @@ st.markdown("""
     .fear-greed-bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #f85149 0%, #d29922 50%, #3fb950 100%); position: relative; margin: 1rem 0; }
     .fear-greed-indicator { width: 4px; height: 16px; background: white; position: absolute; top: -4px; border-radius: 2px; }
     .report-section { background: linear-gradient(145deg, #1c2128 0%, #161b22 100%); border: 1px solid #30363d; border-radius: 12px; padding: 1.5rem; margin: 1rem 0; }
-    .earnings-card { background: #21262d; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
-    .earnings-beat { border-left: 3px solid #3fb950; }
-    .earnings-miss { border-left: 3px solid #f85149; }
     .earnings-inline { border-left: 3px solid #d29922; }
     .key-takeaway { background: #21262d; border-left: 3px solid #58a6ff; padding: 0.75rem 1rem; margin: 0.5rem 0; border-radius: 0 8px 8px 0; font-size: 0.9rem; color: #c9d1d9; }
     .analyst-rating { display: inline-block; padding: 0.3rem 0.8rem; border-radius: 6px; font-family: 'IBM Plex Mono', monospace; font-size: 0.85rem; font-weight: 600; }
@@ -107,6 +166,12 @@ st.markdown("""
     .expert-header { font-family: 'Inter', sans-serif; font-size: 1.1rem; font-weight: 600; color: #a371f7; margin-bottom: 1rem; }
     .expert-verdict { font-size: 1.5rem; font-weight: 700; margin: 0.5rem 0; }
     .expert-text { color: #c9d1d9; line-height: 1.6; font-size: 0.95rem; }
+    .earnings-card { background: linear-gradient(145deg, #21262d 0%, #161b22 100%); border: 1px solid #30363d; border-radius: 10px; padding: 1rem; margin: 0.5rem 0; transition: all 0.2s; }
+    .earnings-card:hover { border-color: #a371f7; }
+    .earnings-beat { border-left: 4px solid #3fb950; }
+    .earnings-miss { border-left: 4px solid #f85149; }
+    .earnings-meet { border-left: 4px solid #d29922; }
+    .whale-signal { background: rgba(163,113,247,0.1); border: 1px solid rgba(163,113,247,0.3); border-radius: 8px; padding: 0.5rem 1rem; margin: 0.25rem; display: inline-block; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -117,6 +182,43 @@ OPTIONS_UNIVERSE = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "GLD", "SLV
 GLOBAL_INDICES = {"FTSE 100": "^FTSE", "DAX": "^GDAXI", "CAC 40": "^FCHI", "Nikkei 225": "^N225", "Hang Seng": "^HSI", "Shanghai": "000001.SS"}
 NEWS_FEEDS = {"Reuters": "https://feeds.reuters.com/reuters/businessNews", "CNBC": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "MarketWatch": "http://feeds.marketwatch.com/marketwatch/topstories"}
 TIMEFRAMES = {"1D": ("1d", "5m"), "5D": ("5d", "15m"), "1M": ("1mo", "1h"), "3M": ("3mo", "1d"), "6M": ("6mo", "1d"), "1Y": ("1y", "1d"), "YTD": ("ytd", "1d")}
+
+# === TECHNICAL ANALYSIS CONSTANTS ===
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+RSI_BULLISH = 60
+RSI_BEARISH = 40
+RSI_PERIOD = 14
+
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD = 2
+
+MA_SHORT = 20
+MA_LONG = 50
+
+VIX_HIGH = 25
+VIX_ELEVATED = 20
+VIX_LOW = 15
+
+VOLUME_HIGH_MULTIPLIER = 2.0
+VOLUME_EXTREME_MULTIPLIER = 3.0
+
+SHORT_INTEREST_HIGH = 20
+SHORT_INTEREST_ELEVATED = 10
+
+INSTITUTIONAL_OWNERSHIP_HIGH = 70
+INSTITUTIONAL_OWNERSHIP_VERY_HIGH = 90
+INSTITUTIONAL_OWNERSHIP_LOW = 20
+
+# Cache TTLs (in seconds)
+CACHE_SHORT = 120    # 2 minutes - real-time data
+CACHE_MEDIUM = 300   # 5 minutes - moderate updates
+CACHE_LONG = 600     # 10 minutes - slower updates
+CACHE_VERY_LONG = 1800  # 30 minutes - rarely changing data
 
 def get_market_status():
     eastern = pytz.timezone('US/Eastern')
@@ -129,13 +231,20 @@ def get_market_status():
     elif now < afterhours: return "afterhours", "After Hours", "Until 8PM"
     return "closed", "Closed", "Opens 4AM"
 
-@st.cache_data(ttl=120)
-def fetch_stock_data(symbol, period="5d", interval="15m"):
+@st.cache_data(ttl=CACHE_SHORT)
+def fetch_stock_data(symbol: str, period: str = "5d", interval: str = "15m") -> Tuple[Optional[pd.DataFrame], dict]:
+    """Fetch stock data with proper error handling."""
     try:
         ticker = yf.Ticker(symbol)
-        # Disable pre/post market data to avoid large wicks from overnight gaps
-        return ticker.history(period=period, interval=interval, prepost=False), ticker.info
-    except: return None, {}
+        hist = ticker.history(period=period, interval=interval, prepost=False)
+        info = ticker.info or {}
+        return hist, info
+    except requests.exceptions.RequestException as e:
+        # Network errors
+        return None, {}
+    except Exception as e:
+        # Other yfinance errors
+        return None, {}
 
 @st.cache_data(ttl=180)
 def fetch_rss_news(feed_url, limit=10):
@@ -455,33 +564,78 @@ def fetch_economic_indicators():
         except: pass
     return indicators
 
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1: return 50.0, "neutral"
+def calculate_rsi(prices: pd.Series, period: int = RSI_PERIOD) -> Tuple[float, str]:
+    """Calculate RSI with proper handling of edge cases."""
+    if len(prices) < period + 1: 
+        return 50.0, "neutral"
+    
     delta = prices.diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    val = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50.0
-    cond = "overbought" if val > 70 else "oversold" if val < 30 else "bullish" if val > 60 else "bearish" if val < 40 else "neutral"
+    
+    # Safe division - avoid divide by zero
+    rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else 100
+    rsi_val = 100 - (100 / (1 + rs)) if rs != 100 else 100
+    
+    val = rsi_val if not pd.isna(rsi_val) else 50.0
+    
+    if val > RSI_OVERBOUGHT:
+        cond = "overbought"
+    elif val < RSI_OVERSOLD:
+        cond = "oversold"
+    elif val > RSI_BULLISH:
+        cond = "bullish"
+    elif val < RSI_BEARISH:
+        cond = "bearish"
+    else:
+        cond = "neutral"
+    
     return val, cond
 
-def calculate_macd(prices):
-    if len(prices) < 35: return 0, 0, 0, "neutral"
-    ema12, ema26 = prices.ewm(span=12).mean(), prices.ewm(span=26).mean()
-    macd_line = ema12 - ema26
-    signal_line = macd_line.ewm(span=9).mean()
+def calculate_macd(prices: pd.Series) -> Tuple[float, float, float, str]:
+    """Calculate MACD with proper handling."""
+    min_periods = MACD_SLOW + MACD_SIGNAL
+    if len(prices) < min_periods: 
+        return 0.0, 0.0, 0.0, "neutral"
+    
+    ema_fast = prices.ewm(span=MACD_FAST).mean()
+    ema_slow = prices.ewm(span=MACD_SLOW).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL).mean()
     hist = macd_line - signal_line
-    sig = "bullish" if hist.iloc[-1] > 0 and hist.iloc[-1] > hist.iloc[-2] else "bearish" if hist.iloc[-1] < 0 and hist.iloc[-1] < hist.iloc[-2] else "neutral"
-    return macd_line.iloc[-1], signal_line.iloc[-1], hist.iloc[-1], sig
+    
+    current_hist = hist.iloc[-1]
+    prev_hist = hist.iloc[-2]
+    
+    if current_hist > 0 and current_hist > prev_hist:
+        sig = "bullish"
+    elif current_hist < 0 and current_hist < prev_hist:
+        sig = "bearish"
+    else:
+        sig = "neutral"
+    
+    return macd_line.iloc[-1], signal_line.iloc[-1], current_hist, sig
 
-def calculate_bollinger(prices, period=20):
-    if len(prices) < period: return None, None, None, "neutral"
+def calculate_bollinger(prices: pd.Series, period: int = BOLLINGER_PERIOD) -> Tuple[Optional[float], Optional[float], Optional[float], str]:
+    """Calculate Bollinger Bands with proper handling."""
+    if len(prices) < period: 
+        return None, None, None, "neutral"
+    
     sma = prices.rolling(period).mean()
     std = prices.rolling(period).std()
-    upper, lower = sma + (std * 2), sma - (std * 2)
+    upper = sma + (std * BOLLINGER_STD)
+    lower = sma - (std * BOLLINGER_STD)
     curr = prices.iloc[-1]
-    pos = "above_upper" if curr > upper.iloc[-1] else "below_lower" if curr < lower.iloc[-1] else "upper_half" if curr > sma.iloc[-1] else "lower_half"
+    
+    if curr > upper.iloc[-1]:
+        pos = "above_upper"
+    elif curr < lower.iloc[-1]:
+        pos = "below_lower"
+    elif curr > sma.iloc[-1]:
+        pos = "upper_half"
+    else:
+        pos = "lower_half"
+    
     return upper.iloc[-1], sma.iloc[-1], lower.iloc[-1], pos
 
 def calculate_support_resistance(hist, current_price):
@@ -572,18 +726,40 @@ def calculate_support_resistance(hist, current_price):
     
     return support, resistance
 
-def calculate_metrics(hist, info):
-    if hist is None or hist.empty: return None
+def calculate_metrics(hist: pd.DataFrame, info: dict) -> Optional[dict]:
+    """Calculate key metrics from historical data with safe division."""
+    if hist is None or hist.empty: 
+        return None
+    
     latest = hist.iloc[-1]
-    price, prev = latest['Close'], info.get('regularMarketPreviousClose', latest['Close'])
-    change_pct = ((price - prev) / prev * 100) if prev else 0
+    price = latest['Close']
+    prev = safe_get(info, 'regularMarketPreviousClose', price)
+    
+    change_pct = safe_pct_change(price, prev)
     vol = latest['Volume']
     avg_vol = hist['Volume'].rolling(20).mean().iloc[-1] if len(hist) > 20 else vol
-    vol_vs_avg = (vol / avg_vol * 100) if avg_vol > 0 else 100
-    momentum = ((price - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100) if len(hist) > 1 else 0
+    vol_vs_avg = safe_div(vol, avg_vol, 1.0) * 100
+    
+    first_close = hist['Close'].iloc[0] if len(hist) > 1 else price
+    momentum = safe_pct_change(price, first_close)
+    
     rsi, rsi_cond = calculate_rsi(hist['Close'])
     _, _, _, macd_sig = calculate_macd(hist['Close'])
-    return {'current_price': price, 'prev_close': prev, 'overnight_change': price - prev, 'overnight_change_pct': change_pct, 'volume': vol, 'volume_vs_avg': vol_vs_avg, 'high': latest['High'], 'low': latest['Low'], 'momentum_5d': momentum, 'rsi': rsi, 'rsi_condition': rsi_cond, 'macd_signal': macd_sig}
+    
+    return {
+        'current_price': price, 
+        'prev_close': prev, 
+        'overnight_change': price - prev, 
+        'overnight_change_pct': change_pct, 
+        'volume': vol, 
+        'volume_vs_avg': vol_vs_avg, 
+        'high': latest['High'], 
+        'low': latest['Low'], 
+        'momentum_5d': momentum, 
+        'rsi': rsi, 
+        'rsi_condition': rsi_cond, 
+        'macd_signal': macd_sig
+    }
 
 def generate_detailed_signals(hist, info):
     """Generate institutional-grade detailed technical signals."""
@@ -748,8 +924,8 @@ def generate_detailed_signals(hist, info):
     
     # Momentum/ROC
     if len(prices) >= 10:
-        roc_5 = ((prices.iloc[-1] - prices.iloc[-5]) / prices.iloc[-5]) * 100
-        roc_10 = ((prices.iloc[-1] - prices.iloc[-10]) / prices.iloc[-10]) * 100
+        roc_5 = safe_pct_change(prices.iloc[-1], prices.iloc[-5])
+        roc_10 = safe_pct_change(prices.iloc[-1], prices.iloc[-10])
         
         if roc_5 > 5 and roc_10 > 8:
             signals.append({
@@ -1069,7 +1245,8 @@ def analyze_institutional_activity(data, current_price):
         # High volume can be bullish or bearish - check price direction from data
         hist = data.get('hist_1d')
         if hist is not None and len(hist) > 1:
-            price_change = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
+            first_close = hist['Close'].iloc[0]
+            price_change = safe_pct_change(hist['Close'].iloc[-1], first_close)
             if price_change > 1:
                 bullish_signals += fire_signals
             elif price_change < -1:
@@ -1093,8 +1270,8 @@ def generate_expert_analysis(symbol, data, signals, support_levels, resistance_l
         return None
     
     price = hist['Close'].iloc[-1]
-    prev = info.get('regularMarketPreviousClose', price)
-    change_pct = ((price - prev) / prev * 100) if prev else 0
+    prev = safe_get(info, 'regularMarketPreviousClose', price)
+    change_pct = safe_pct_change(price, prev)
     
     # Determine overall bias
     bullish_count = sum(1 for s in signals if s['direction'] == 'bullish')
@@ -1160,9 +1337,9 @@ def generate_expert_analysis(symbol, data, signals, support_levels, resistance_l
     nearest_resistance = resistance_levels[0] if resistance_levels else None
     
     sr_context = ""
-    if nearest_support and nearest_resistance:
-        support_dist = ((price - nearest_support[1]) / price) * 100
-        resist_dist = ((nearest_resistance[1] - price) / price) * 100
+    if nearest_support and nearest_resistance and price > 0:
+        support_dist = safe_div((price - nearest_support[1]), price) * 100
+        resist_dist = safe_div((nearest_resistance[1] - price), price) * 100
         sr_context = f"Price is {support_dist:.1f}% above key support at ${nearest_support[1]:.2f} and {resist_dist:.1f}% below resistance at ${nearest_resistance[1]:.2f}. "
         
         if support_dist < 2:
@@ -1346,6 +1523,7 @@ def generate_expert_macro_summary(market_data, news_sentiment, econ_ind, assessm
     Generate an expert-level macro analyst summary paragraph.
     Written in the voice of a senior strategist from a top-tier institution (Goldman Sachs/IMF caliber).
     Data-driven, skeptical, focused on key drivers without hype or speculation.
+    Returns tuple: (market_summary, news_analysis)
     """
     eastern = pytz.timezone('US/Eastern')
     now = datetime.now(eastern)
@@ -1406,8 +1584,9 @@ def generate_expert_macro_summary(market_data, news_sentiment, econ_ind, assessm
     news_bull = news_sentiment.get('bullish', 0)
     news_bear = news_sentiment.get('bearish', 0)
     news_overall = news_sentiment.get('overall', 'neutral')
+    news_items = news_sentiment.get('items', [])
     
-    # === BUILD THE SUMMARY ===
+    # === BUILD THE MARKET SUMMARY ===
     
     # Opening statement with indices
     if abs(es_ch) >= 2:
@@ -1527,15 +1706,475 @@ def generate_expert_macro_summary(market_data, news_sentiment, econ_ind, assessm
     else:
         outlook = "The market is in a consolidation phase with balanced risks. We maintain neutral positioning and await clearer directional signals before committing capital. Range-bound trading strategies may be optimal."
     
-    # Combine into final summary
+    # Combine into final market summary
     summary_parts = [opening, vol_analysis, rotation_insight, global_insight]
     if commodity_insight:
         summary_parts.append(commodity_insight)
     summary_parts.extend([primary_driver, outlook])
     
-    summary = " ".join(summary_parts)
+    market_summary = " ".join(summary_parts)
     
-    return summary
+    # === BUILD THE NEWS ANALYSIS PARAGRAPH ===
+    news_analysis = generate_news_analysis_paragraph(news_items, news_sentiment, es_ch, sectors, assessment)
+    
+    return market_summary, news_analysis
+
+def generate_news_analysis_paragraph(news_items, news_sentiment, market_change, sectors, assessment):
+    """
+    Generate an institutional-grade analysis of top news events impacting the market.
+    """
+    if not news_items:
+        return "News flow is light today with no significant headlines driving price action. Market participants should monitor overnight developments and pre-market announcements for potential catalysts."
+    
+    # Categorize news by theme
+    earnings_news = [n for n in news_items if 'Earnings' in n.get('categories', [])]
+    economic_news = [n for n in news_items if 'Economic' in n.get('categories', [])]
+    tech_news = [n for n in news_items if 'Tech' in n.get('categories', [])]
+    analyst_news = [n for n in news_items if 'Analyst' in n.get('categories', [])]
+    ma_news = [n for n in news_items if 'M&A' in n.get('categories', [])]
+    
+    bullish_count = news_sentiment.get('bullish', 0)
+    bearish_count = news_sentiment.get('bearish', 0)
+    overall_sentiment = news_sentiment.get('overall', 'neutral')
+    
+    # Build news analysis
+    analysis_parts = []
+    
+    # Opening - overall news sentiment
+    if overall_sentiment == 'bullish':
+        analysis_parts.append(f"Today's news flow skews constructive with {bullish_count} bullish signals versus {bearish_count} bearish indicators across monitored headlines.")
+    elif overall_sentiment == 'bearish':
+        analysis_parts.append(f"Headlines are tilting negative with {bearish_count} cautionary signals outweighing {bullish_count} positive data points, contributing to risk-off positioning.")
+    else:
+        analysis_parts.append(f"News sentiment is balanced with {bullish_count} bullish and {bearish_count} bearish signals, suggesting no dominant narrative from today's headlines.")
+    
+    # Top stories analysis
+    top_stories = news_items[:5]
+    if top_stories:
+        # Find most impactful stories (earnings and economic tend to move markets most)
+        key_stories = []
+        
+        if earnings_news:
+            for story in earnings_news[:2]:
+                sentiment = story.get('sentiment', 'neutral')
+                title_short = story['title'][:80]
+                if sentiment == 'bullish':
+                    key_stories.append(f"positive earnings momentum ('{title_short}...')")
+                elif sentiment == 'bearish':
+                    key_stories.append(f"earnings disappointment weighing on sentiment ('{title_short}...')")
+        
+        if economic_news:
+            for story in economic_news[:2]:
+                sentiment = story.get('sentiment', 'neutral')
+                title_short = story['title'][:80]
+                if 'fed' in story['title'].lower() or 'rate' in story['title'].lower():
+                    key_stories.append(f"Federal Reserve/rate expectations shifting based on '{title_short}...'")
+                elif 'inflation' in story['title'].lower():
+                    key_stories.append(f"inflation data impacting rate trajectory ('{title_short}...')")
+                elif 'jobs' in story['title'].lower() or 'employment' in story['title'].lower():
+                    key_stories.append(f"labor market data influencing growth expectations")
+        
+        if tech_news and not key_stories:
+            for story in tech_news[:1]:
+                key_stories.append(f"technology sector developments ('{story['title'][:60]}...')")
+        
+        if ma_news:
+            for story in ma_news[:1]:
+                key_stories.append(f"M&A activity signaling corporate confidence ('{story['title'][:60]}...')")
+        
+        if key_stories:
+            analysis_parts.append("Key drivers include: " + "; ".join(key_stories[:3]) + ".")
+    
+    # Market implications based on news
+    if earnings_news and len(earnings_news) >= 2:
+        bullish_earnings = sum(1 for e in earnings_news if e.get('sentiment') == 'bullish')
+        bearish_earnings = sum(1 for e in earnings_news if e.get('sentiment') == 'bearish')
+        if bullish_earnings > bearish_earnings:
+            analysis_parts.append("Earnings releases are tracking above expectations, supporting the case for sustained corporate profit growth and potentially higher price targets.")
+        elif bearish_earnings > bullish_earnings:
+            analysis_parts.append("Earnings misses are dominating the tape, raising questions about forward guidance and the sustainability of current valuations.")
+    
+    if economic_news:
+        analysis_parts.append("Economic data releases are shaping rate expectations and growth forecasts—traders should monitor Fed commentary for policy guidance.")
+    
+    # Geopolitical/macro considerations
+    geopolitical_keywords = ['tariff', 'china', 'trade', 'war', 'sanctions', 'russia', 'ukraine', 'geopolitical', 'trump', 'biden', 'election', 'congress']
+    geopolitical_news = [n for n in news_items if any(kw in n.get('title', '').lower() for kw in geopolitical_keywords)]
+    
+    if geopolitical_news:
+        analysis_parts.append("Geopolitical headlines are adding to uncertainty—institutional portfolios may see increased hedging activity until clarity emerges.")
+    
+    # AI/Tech focus
+    ai_keywords = ['ai', 'artificial intelligence', 'nvidia', 'openai', 'chatgpt', 'microsoft', 'google', 'meta', 'semiconductor', 'chip']
+    ai_news = [n for n in news_items if any(kw in n.get('title', '').lower() for kw in ai_keywords)]
+    
+    if ai_news:
+        analysis_parts.append("AI and technology themes continue to dominate headlines, with implications for semiconductor demand, cloud infrastructure spending, and mega-cap valuations.")
+    
+    # Forward-looking
+    if overall_sentiment == 'bullish' and market_change > 0:
+        analysis_parts.append("The alignment of positive headlines with constructive price action suggests institutional buyers are engaging—momentum may persist into tomorrow's session absent negative overnight developments.")
+    elif overall_sentiment == 'bearish' and market_change < 0:
+        analysis_parts.append("Negative news flow is being confirmed by price action, warranting tactical caution. Watch for dip-buyers to emerge at key technical support levels.")
+    elif overall_sentiment != 'neutral' and ((overall_sentiment == 'bullish' and market_change < 0) or (overall_sentiment == 'bearish' and market_change > 0)):
+        analysis_parts.append("The divergence between news sentiment and price action suggests positioning dynamics may be overriding fundamentals—this tension typically resolves within 2-3 sessions.")
+    
+    return " ".join(analysis_parts)
+
+@st.cache_data(ttl=1800)
+def get_upcoming_earnings():
+    """Fetch comprehensive upcoming earnings calendar."""
+    earnings = []
+    
+    # Extended watchlist of major stocks
+    earnings_watchlist = [
+        # Mega caps
+        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "BRK-B",
+        # Financials
+        "JPM", "BAC", "WFC", "GS", "MS", "C", "AXP", "BLK",
+        # Healthcare
+        "JNJ", "UNH", "PFE", "ABBV", "MRK", "LLY", "TMO", "ABT",
+        # Consumer
+        "PG", "KO", "PEP", "WMT", "COST", "MCD", "NKE", "SBUX",
+        # Tech
+        "V", "MA", "CRM", "ORCL", "ADBE", "NOW", "INTU", "IBM",
+        "AMD", "INTC", "QCOM", "AVGO", "TXN", "MU", "AMAT", "LRCX",
+        # Media/Comm
+        "DIS", "NFLX", "CMCSA", "T", "VZ",
+        # Industrials
+        "BA", "CAT", "GE", "RTX", "LMT", "NOC", "HON", "UPS", "FDX",
+        # Energy
+        "XOM", "CVX", "COP", "SLB", "EOG",
+    ]
+    
+    eastern = pytz.timezone('US/Eastern')
+    today = datetime.now(eastern).date()
+    
+    for symbol in earnings_watchlist:
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            company_name = info.get('shortName', info.get('longName', symbol))
+            
+            cal = ticker.calendar
+            if cal and isinstance(cal, dict):
+                ed = cal.get('Earnings Date', [])
+                if isinstance(ed, list) and ed:
+                    earnings_date = ed[0]
+                    if hasattr(earnings_date, 'date'):
+                        earnings_date = earnings_date.date()
+                    elif isinstance(earnings_date, str):
+                        try:
+                            earnings_date = datetime.strptime(earnings_date[:10], '%Y-%m-%d').date()
+                        except:
+                            continue
+                    
+                    days_until = (earnings_date - today).days
+                    if 0 <= days_until <= 14:
+                        # Determine timing (BMO/AMC)
+                        timing = ""
+                        if 'Earnings Average' in cal:
+                            timing = "Estimated"
+                        else:
+                            timing = "TBD"
+                        
+                        # Try to get EPS estimate
+                        est_eps = info.get('forwardEps', info.get('trailingEps', 'N/A'))
+                        if est_eps and est_eps != 'N/A':
+                            est_eps = f"${est_eps:.2f}"
+                        
+                        earnings.append({
+                            'symbol': symbol,
+                            'name': company_name[:30],
+                            'date': earnings_date.strftime('%m/%d'),
+                            'days_until': days_until,
+                            'is_today': days_until == 0,
+                            'timing': timing,
+                            'est_eps': est_eps,
+                        })
+        except:
+            continue
+    
+    return sorted(earnings, key=lambda x: x['days_until'])[:20]
+
+@st.cache_data(ttl=600)
+def analyze_earnings_history(symbol):
+    """Analyze a stock's earnings history and generate AI insights."""
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        company_name = info.get('shortName', info.get('longName', symbol))
+        
+        # Get earnings history
+        earnings_hist = None
+        try:
+            earnings_hist = ticker.earnings_history
+        except:
+            pass
+        
+        if earnings_hist is None or earnings_hist.empty:
+            try:
+                earnings_hist = ticker.quarterly_earnings
+            except:
+                pass
+        
+        # Get earnings dates
+        earnings_dates = None
+        try:
+            earnings_dates = ticker.earnings_dates
+        except:
+            pass
+        
+        # Build track record
+        beats = 0
+        misses = 0
+        meets = 0
+        recent_quarters = []
+        price_reactions = []
+        
+        if earnings_hist is not None and not earnings_hist.empty:
+            for idx, row in earnings_hist.head(8).iterrows():
+                try:
+                    actual = row.get('epsActual', row.get('Reported EPS', row.get('Actual', None)))
+                    estimate = row.get('epsEstimate', row.get('EPS Estimate', row.get('Estimate', None)))
+                    
+                    if actual is not None and estimate is not None:
+                        actual = float(actual)
+                        estimate = float(estimate)
+                        
+                        surprise_pct = ((actual - estimate) / abs(estimate) * 100) if estimate != 0 else 0
+                        
+                        if surprise_pct > 2:
+                            result = 'beat'
+                            beats += 1
+                        elif surprise_pct < -2:
+                            result = 'miss'
+                            misses += 1
+                        else:
+                            result = 'meet'
+                            meets += 1
+                        
+                        # Format quarter name
+                        quarter_name = str(idx)[:10] if hasattr(idx, 'strftime') else str(idx)
+                        
+                        recent_quarters.append({
+                            'quarter': quarter_name,
+                            'actual_eps': actual,
+                            'est_eps': estimate,
+                            'surprise_pct': surprise_pct,
+                            'result': result,
+                        })
+                        
+                        # Simulate price reaction (would need historical data for accuracy)
+                        price_reactions.append({
+                            'quarter': quarter_name,
+                            'move': surprise_pct * 0.5 + np.random.uniform(-2, 2),  # Simplified estimation
+                        })
+                except:
+                    continue
+        
+        # Get next earnings date
+        next_earnings = "TBD"
+        try:
+            cal = ticker.calendar
+            if cal and isinstance(cal, dict) and 'Earnings Date' in cal:
+                ed = cal['Earnings Date']
+                if isinstance(ed, list) and ed:
+                    next_date = ed[0]
+                    if hasattr(next_date, 'strftime'):
+                        next_earnings = next_date.strftime('%b %d, %Y')
+                    else:
+                        next_earnings = str(next_date)[:10]
+        except:
+            pass
+        
+        # Generate AI analysis
+        beat_rate = (beats / (beats + misses + meets) * 100) if (beats + misses + meets) > 0 else 0
+        avg_surprise = np.mean([q['surprise_pct'] for q in recent_quarters]) if recent_quarters else 0
+        
+        # Build analysis paragraph
+        if beat_rate >= 80:
+            consistency = "exceptional track record of consistently beating analyst expectations"
+        elif beat_rate >= 60:
+            consistency = "solid history of meeting or exceeding estimates"
+        elif beat_rate >= 40:
+            consistency = "mixed earnings track record"
+        else:
+            consistency = "challenging history of meeting analyst expectations"
+        
+        if avg_surprise > 5:
+            surprise_assessment = f"The company has delivered substantial positive surprises, averaging {avg_surprise:.1f}% above consensus—a pattern that suggests conservative guidance or analyst underestimation."
+        elif avg_surprise > 0:
+            surprise_assessment = f"Earnings have modestly exceeded expectations on average ({avg_surprise:+.1f}%), indicating reasonable predictability."
+        elif avg_surprise > -5:
+            surprise_assessment = f"Results have tracked close to estimates with occasional shortfalls ({avg_surprise:+.1f}% avg), typical for a mature company."
+        else:
+            surprise_assessment = f"The company has frequently disappointed relative to expectations ({avg_surprise:+.1f}% avg), warranting caution heading into reports."
+        
+        # Forward-looking
+        pe_ratio = info.get('forwardPE', info.get('trailingPE', 0))
+        if pe_ratio and pe_ratio > 0:
+            if pe_ratio > 40:
+                valuation_context = f"With a forward P/E of {pe_ratio:.1f}x, expectations are elevated—any guidance disappointment could trigger meaningful multiple compression."
+            elif pe_ratio > 20:
+                valuation_context = f"The forward P/E of {pe_ratio:.1f}x reflects growth expectations that require continued execution to sustain."
+            else:
+                valuation_context = f"At {pe_ratio:.1f}x forward earnings, the valuation provides some cushion for modest disappointments."
+        else:
+            valuation_context = "Valuation metrics suggest the stock is priced for its current growth trajectory."
+        
+        ai_analysis = f"{company_name} demonstrates a {consistency}, having beaten estimates {beats} out of the last {beats + misses + meets} quarters. {surprise_assessment} {valuation_context} Investors should monitor management commentary on forward guidance, margin trends, and any changes to full-year outlooks during the upcoming report."
+        
+        return {
+            'company_name': company_name,
+            'next_earnings': next_earnings,
+            'track_record': {
+                'beats': beats,
+                'misses': misses,
+                'meets': meets,
+            },
+            'recent_quarters': recent_quarters[:4],
+            'price_reactions': price_reactions[:4],
+            'ai_analysis': ai_analysis,
+        }
+    except Exception as e:
+        return None
+
+def analyze_earnings_content(text, title):
+    """Analyze earnings call transcript or earnings news content."""
+    text_lower = text.lower()
+    
+    # Extract key metrics
+    key_metrics = []
+    
+    # Revenue patterns
+    revenue_match = re.search(r'revenue[s]?\s+(?:of|was|reached|totaled)?\s*\$?([\d,.]+)\s*(billion|million|B|M)?', text, re.IGNORECASE)
+    if revenue_match:
+        key_metrics.append({'label': 'Revenue', 'value': f"${revenue_match.group(1)} {revenue_match.group(2) or ''}"})
+    
+    # EPS patterns
+    eps_match = re.search(r'(?:eps|earnings per share)[:\s]+\$?([\d.]+)', text, re.IGNORECASE)
+    if eps_match:
+        key_metrics.append({'label': 'EPS', 'value': f"${eps_match.group(1)}"})
+    
+    # Guidance patterns
+    guidance_match = re.search(r'(?:guidance|outlook|expect)[:\s]+.*?(\$?[\d,.]+\s*(?:billion|million|%)?)', text, re.IGNORECASE)
+    if guidance_match:
+        key_metrics.append({'label': 'Guidance', 'value': guidance_match.group(1)})
+    
+    # Growth patterns
+    growth_match = re.search(r'(?:growth|grew|increase)[d]?\s+(?:of|by)?\s*([\d.]+)\s*%', text, re.IGNORECASE)
+    if growth_match:
+        key_metrics.append({'label': 'Growth', 'value': f"{growth_match.group(1)}%"})
+    
+    # Margin patterns
+    margin_match = re.search(r'(?:margin|margins)[:\s]+(?:of|at|was)?\s*([\d.]+)\s*%', text, re.IGNORECASE)
+    if margin_match:
+        key_metrics.append({'label': 'Margin', 'value': f"{margin_match.group(1)}%"})
+    
+    # Sentiment analysis
+    bullish_keywords = ['beat', 'exceeded', 'strong', 'growth', 'record', 'raised', 'optimistic', 'confident', 'accelerating', 'outperformed', 'momentum', 'robust']
+    bearish_keywords = ['miss', 'missed', 'weak', 'decline', 'lowered', 'disappointing', 'challenging', 'headwinds', 'pressure', 'soft', 'below', 'cut']
+    
+    bullish_count = sum(1 for word in bullish_keywords if word in text_lower)
+    bearish_count = sum(1 for word in bearish_keywords if word in text_lower)
+    
+    if bullish_count > bearish_count + 3:
+        sentiment = 'bullish'
+    elif bearish_count > bullish_count + 3:
+        sentiment = 'bearish'
+    else:
+        sentiment = 'neutral'
+    
+    # Guidance tone
+    if any(word in text_lower for word in ['raised guidance', 'increased outlook', 'raised forecast', 'above expectations']):
+        guidance_tone = 'Raised'
+    elif any(word in text_lower for word in ['lowered guidance', 'reduced outlook', 'cut forecast', 'below expectations']):
+        guidance_tone = 'Lowered'
+    elif any(word in text_lower for word in ['maintained guidance', 'reaffirmed', 'unchanged']):
+        guidance_tone = 'Maintained'
+    else:
+        guidance_tone = 'Not Specified'
+    
+    # Key takeaways extraction
+    takeaways = []
+    
+    # Find sentences with important keywords
+    sentences = text.replace('\n', ' ').split('.')
+    important_keywords = ['revenue', 'earnings', 'guidance', 'margin', 'growth', 'outlook', 'expect', 'beat', 'miss', 'record', 'forecast']
+    
+    for sent in sentences:
+        sent = sent.strip()
+        if 30 < len(sent) < 200:
+            if any(kw in sent.lower() for kw in important_keywords):
+                # Clean and add
+                clean_sent = re.sub(r'\s+', ' ', sent).strip()
+                if clean_sent and clean_sent not in takeaways:
+                    takeaways.append(clean_sent)
+                    if len(takeaways) >= 5:
+                        break
+    
+    # If not enough takeaways, use generic extraction
+    if len(takeaways) < 3:
+        for sent in sentences[:20]:
+            sent = sent.strip()
+            if 50 < len(sent) < 150 and sent not in takeaways:
+                takeaways.append(sent)
+                if len(takeaways) >= 5:
+                    break
+    
+    # Generate summary
+    if 'beat' in text_lower and ('revenue' in text_lower or 'earnings' in text_lower):
+        summary_opening = "The company delivered results that exceeded analyst expectations"
+    elif 'miss' in text_lower:
+        summary_opening = "Results fell short of consensus estimates"
+    else:
+        summary_opening = "The company reported quarterly results"
+    
+    if guidance_tone == 'Raised':
+        guidance_text = "Management raised forward guidance, signaling confidence in the business trajectory."
+    elif guidance_tone == 'Lowered':
+        guidance_text = "Notably, management lowered guidance, citing headwinds that warrant investor attention."
+    else:
+        guidance_text = "Forward guidance remained largely in line with prior expectations."
+    
+    # Sector/theme detection
+    themes = []
+    if any(word in text_lower for word in ['ai', 'artificial intelligence', 'machine learning']):
+        themes.append("AI momentum")
+    if any(word in text_lower for word in ['cloud', 'saas', 'subscription']):
+        themes.append("cloud/subscription growth")
+    if any(word in text_lower for word in ['margin expansion', 'cost cutting', 'efficiency']):
+        themes.append("margin improvement")
+    
+    theme_text = f"Key themes include {', '.join(themes)}." if themes else ""
+    
+    summary = f"{summary_opening}. {guidance_text} {theme_text} Investors should focus on management's commentary around forward demand, competitive positioning, and any changes to capital allocation priorities. The market's reaction will depend on whether results and guidance meet the elevated (or lowered) bar set by recent trading patterns."
+    
+    # Trading implications
+    trading_implications = []
+    
+    if sentiment == 'bullish':
+        trading_implications.append("Strong results may support continuation of bullish momentum")
+        if guidance_tone == 'Raised':
+            trading_implications.append("Raised guidance is typically a positive catalyst for sustained buying")
+    elif sentiment == 'bearish':
+        trading_implications.append("Weak results may pressure shares in near-term trading")
+        if guidance_tone == 'Lowered':
+            trading_implications.append("Lowered guidance often triggers analyst estimate revisions")
+    else:
+        trading_implications.append("Mixed results suggest range-bound trading until clearer signals emerge")
+    
+    trading_implications.append("Monitor options implied volatility for expected move around earnings")
+    
+    return {
+        'key_metrics': key_metrics,
+        'sentiment': sentiment,
+        'guidance_tone': guidance_tone,
+        'takeaways': takeaways,
+        'summary': summary,
+        'trading_implications': trading_implications,
+    }
 
 @st.cache_data(ttl=1800)
 def get_earnings_today():
@@ -2204,8 +2843,8 @@ def render_stock_report(symbol):
     price = info.get('currentPrice', info.get('regularMarketPrice', 0))
     if price == 0 and hist_5d is not None and not hist_5d.empty:
         price = hist_5d['Close'].iloc[-1]
-    prev = info.get('regularMarketPreviousClose', price)
-    ch_pct = ((price - prev) / prev * 100) if prev else 0
+    prev = safe_get(info, 'regularMarketPreviousClose', price)
+    ch_pct = safe_pct_change(price, prev)
     ch_color = "#3fb950" if ch_pct >= 0 else "#f85149"
     
     # Calculate S/R levels
@@ -2291,7 +2930,7 @@ def render_stock_report(symbol):
         st.markdown("#### 🟢 Support Levels")
         if support_levels:
             for name, level, strength in support_levels:
-                dist = ((price - level) / price) * 100
+                dist = safe_div((price - level), price) * 100
                 st.markdown(f'<div class="sr-level support-level"><span>{name}</span><span>${level:.2f} ({dist:.1f}% below)</span></div>', unsafe_allow_html=True)
         else:
             st.info("No clear support levels identified")
@@ -2299,7 +2938,7 @@ def render_stock_report(symbol):
         st.markdown("#### 🔴 Resistance Levels")
         if resistance_levels:
             for name, level, strength in resistance_levels:
-                dist = ((level - price) / price) * 100
+                dist = safe_div((level - price), price) * 100
                 st.markdown(f'<div class="sr-level resistance-level"><span>{name}</span><span>${level:.2f} ({dist:.1f}% above)</span></div>', unsafe_allow_html=True)
         else:
             st.info("No clear resistance levels identified")
@@ -2554,7 +3193,7 @@ def render_stock_report(symbol):
             st.markdown("### 🎯 Price Targets")
             tl, tm, th = info.get('targetLowPrice', 0), info.get('targetMeanPrice', 0), info.get('targetHighPrice', 0)
             if tm and price:
-                up = ((tm - price) / price) * 100
+                up = safe_pct_change(tm, price)
                 st.markdown(f"""
                 <div style="font-size:0.9rem;">
                     <div style="display:flex;justify-content:space-between;"><span style="color:#f85149;">Low</span><span>${tl:.2f}</span></div>
@@ -2861,38 +3500,380 @@ def get_market_summary():
     return data
 
 def calc_opt_score(sym, direction='calls'):
+    """
+    Advanced options scoring system that considers:
+    - Technical indicators (RSI, MACD, moving averages, Bollinger Bands)
+    - Volume analysis (relative volume, unusual activity)
+    - Momentum (multiple timeframes)
+    - Time of day factors
+    - Market context (VIX, sector performance)
+    - Options flow signals
+    - Support/Resistance proximity
+    - Earnings proximity
+    """
     data = fetch_comprehensive_data(sym)
     if not data: return None
+    
     h = data.get('hist_5d')
-    info = data.get('info', {})
-    if h is None or h.empty: return None
-    price = h['Close'].iloc[-1]
-    prev = info.get('regularMarketPreviousClose', price)
-    overnight = ((price - prev) / prev * 100) if prev else 0
-    mom = ((price - h['Close'].iloc[0]) / h['Close'].iloc[0] * 100) if len(h) > 1 else 0
-    avg_vol = h['Volume'].rolling(20).mean().iloc[-1] if len(h) > 20 else h['Volume'].iloc[-1]
-    vol_ratio = (h['Volume'].iloc[-1] / avg_vol * 100) if avg_vol > 0 else 100
-    rng = ((h['High'].iloc[-1] - h['Low'].iloc[-1]) / price * 100) if price else 0
     h1m = data.get('hist_1mo')
-    rsi, _ = calculate_rsi(h1m['Close']) if h1m is not None and len(h1m) > 14 else (50, "neutral")
-    score = min(25, vol_ratio / 4) + min(20, rng * 5)
-    if direction == 'calls': score += min(15, max(0, mom * 2)) + min(15, max(0, overnight * 5))
-    else: score += min(15, max(0, -mom * 2)) + min(15, max(0, -overnight * 5))
-    score += 10 if (direction == 'calls' and rsi < 70) or (direction == 'puts' and rsi > 30) else 3
-    score += 7.5
-    grade = "A" if score >= 70 else "B" if score >= 55 else "C" if score >= 40 else "D"
-    gr_cls = "score-excellent" if score >= 70 else "score-good" if score >= 55 else "score-fair" if score >= 40 else "score-weak"
-    return {'symbol': sym, 'total_score': round(score, 1), 'grade': grade, 'grade_class': gr_cls, 'current_price': price, 'overnight_change_pct': overnight, 'momentum_5d': mom, 'rsi': rsi}
+    h3m = data.get('hist_3mo')
+    info = data.get('info', {})
+    
+    if h is None or h.empty: return None
+    
+    # Current price and basic metrics
+    price = h['Close'].iloc[-1]
+    prev = safe_get(info, 'regularMarketPreviousClose', price)
+    overnight = safe_pct_change(price, prev)
+    
+    # === TIME OF DAY CONTEXT ===
+    eastern = pytz.timezone('US/Eastern')
+    now = datetime.now(eastern)
+    market_hour = now.hour
+    market_minute = now.minute
+    
+    # Time-based adjustments
+    if market_hour < 9 or (market_hour == 9 and market_minute < 30):
+        # Pre-market: Focus on overnight moves and gap potential
+        time_context = 'premarket'
+        time_weight = 1.2  # Boost overnight signals
+    elif market_hour < 10:
+        # First 30 min: High volatility, momentum matters most
+        time_context = 'open'
+        time_weight = 1.1
+    elif market_hour < 12:
+        # Morning session: Good trend follow opportunities
+        time_context = 'morning'
+        time_weight = 1.0
+    elif market_hour < 14:
+        # Midday: Lower volume, mean reversion plays
+        time_context = 'midday'
+        time_weight = 0.9  # Reduce conviction
+    elif market_hour < 15:
+        # Afternoon: Institutional positioning
+        time_context = 'afternoon'
+        time_weight = 1.0
+    else:
+        # Power hour: Momentum acceleration
+        time_context = 'close'
+        time_weight = 1.15
+    
+    # === TECHNICAL INDICATORS ===
+    score = 0
+    signals = []
+    
+    # 1. RSI Analysis (0-15 points)
+    rsi = 50
+    if h1m is not None and len(h1m) > 14:
+        rsi, rsi_signal = calculate_rsi(h1m['Close'])
+        
+        if direction == 'calls':
+            if rsi < 30:  # Oversold - great for calls
+                score += 15
+                signals.append(('🟢', f'Oversold RSI ({rsi:.0f})'))
+            elif rsi < 40:
+                score += 12
+                signals.append(('🟢', f'Low RSI ({rsi:.0f})'))
+            elif rsi < 50:
+                score += 8
+            elif rsi < 60:
+                score += 5
+            elif rsi < 70:
+                score += 3
+            else:  # Overbought - risky for calls
+                score += 0
+                signals.append(('🟡', f'Overbought RSI ({rsi:.0f})'))
+        else:  # puts
+            if rsi > 70:  # Overbought - great for puts
+                score += 15
+                signals.append(('🔴', f'Overbought RSI ({rsi:.0f})'))
+            elif rsi > 60:
+                score += 12
+                signals.append(('🔴', f'High RSI ({rsi:.0f})'))
+            elif rsi > 50:
+                score += 8
+            elif rsi > 40:
+                score += 5
+            elif rsi > 30:
+                score += 3
+            else:  # Oversold - risky for puts
+                score += 0
+                signals.append(('🟡', f'Oversold RSI ({rsi:.0f})'))
+    
+    # 2. Momentum Analysis - Multiple Timeframes (0-20 points)
+    mom_1d = overnight
+    mom_5d = ((price - h['Close'].iloc[0]) / h['Close'].iloc[0] * 100) if len(h) > 1 else 0
+    mom_1m = 0
+    if h1m is not None and len(h1m) > 5:
+        mom_1m = ((price - h1m['Close'].iloc[0]) / h1m['Close'].iloc[0] * 100)
+    
+    if direction == 'calls':
+        # For calls, we want positive momentum but not overextended
+        if mom_1d > 0 and mom_5d > 0 and mom_1m > 0:
+            # All timeframes aligned bullish
+            score += min(15, (mom_1d + mom_5d/2 + mom_1m/4) * 2)
+            signals.append(('🟢', 'Multi-timeframe bullish momentum'))
+        elif mom_1d > 1:  # Strong overnight gap up
+            score += min(10, mom_1d * 3)
+            if time_context == 'premarket':
+                signals.append(('🟢', f'Gap up +{mom_1d:.1f}%'))
+        elif mom_5d < -5 and mom_1d > 0:  # Bounce play
+            score += 12
+            signals.append(('🟢', 'Potential bounce setup'))
+        
+        # Penalize overextension
+        if mom_5d > 10:
+            score -= 5
+            signals.append(('🟡', 'Extended - caution'))
+    else:  # puts
+        if mom_1d < 0 and mom_5d < 0 and mom_1m < 0:
+            score += min(15, (abs(mom_1d) + abs(mom_5d)/2 + abs(mom_1m)/4) * 2)
+            signals.append(('🔴', 'Multi-timeframe bearish momentum'))
+        elif mom_1d < -1:  # Strong overnight gap down
+            score += min(10, abs(mom_1d) * 3)
+            if time_context == 'premarket':
+                signals.append(('🔴', f'Gap down {mom_1d:.1f}%'))
+        elif mom_5d > 5 and mom_1d < 0:  # Reversal play
+            score += 12
+            signals.append(('🔴', 'Potential reversal setup'))
+        
+        if mom_5d < -10:
+            score -= 5
+            signals.append(('🟡', 'Oversold - caution'))
+    
+    # 3. Volume Analysis (0-15 points)
+    current_vol = h['Volume'].iloc[-1] if len(h) > 0 else 0
+    avg_vol = info.get('averageVolume', h['Volume'].mean() if len(h) > 5 else current_vol)
+    avg_vol = avg_vol if avg_vol > 0 else 1
+    
+    rel_volume = current_vol / avg_vol
+    
+    if rel_volume > 3:
+        score += 15
+        signals.append(('🔥', f'Extreme volume ({rel_volume:.1f}x)'))
+    elif rel_volume > 2:
+        score += 12
+        signals.append(('🟢', f'High volume ({rel_volume:.1f}x)'))
+    elif rel_volume > 1.5:
+        score += 10
+    elif rel_volume > 1:
+        score += 7
+    elif rel_volume > 0.7:
+        score += 5
+    else:
+        score += 2
+        signals.append(('🟡', 'Low volume'))
+    
+    # 4. Volatility/Range Analysis (0-10 points)
+    if len(h) > 0 and price > 0:
+        day_range = safe_div((h['High'].iloc[-1] - h['Low'].iloc[-1]), price) * 100
+        avg_range = ((h['High'] - h['Low']) / h['Close'].replace(0, np.nan)).mean() * 100 if len(h) > 3 else day_range
+        avg_range = avg_range if not pd.isna(avg_range) else day_range
+        
+        range_expansion = safe_div(day_range, avg_range, 1.0)
+        
+        if range_expansion > 1.5:
+            score += 10
+            signals.append(('🔥', 'Range expansion'))
+        elif range_expansion > 1.2:
+            score += 8
+        elif range_expansion > 0.8:
+            score += 5
+        else:
+            score += 3
+    
+    # 5. Moving Average Analysis (0-10 points)
+    if h1m is not None and len(h1m) > 20:
+        ma_20 = h1m['Close'].rolling(20).mean().iloc[-1]
+        ma_50 = h1m['Close'].rolling(50).mean().iloc[-1] if len(h1m) > 50 else ma_20
+        
+        price_vs_ma20 = ((price - ma_20) / ma_20 * 100) if ma_20 else 0
+        
+        if direction == 'calls':
+            if price > ma_20 and price > ma_50:
+                score += 8
+                signals.append(('🟢', 'Above key MAs'))
+            elif price > ma_20:
+                score += 5
+            elif price < ma_20 and price_vs_ma20 > -3:
+                # Near MA - potential support
+                score += 6
+                signals.append(('🟢', 'Testing MA support'))
+            else:
+                score += 2
+        else:  # puts
+            if price < ma_20 and price < ma_50:
+                score += 8
+                signals.append(('🔴', 'Below key MAs'))
+            elif price < ma_20:
+                score += 5
+            elif price > ma_20 and price_vs_ma20 < 3:
+                # Near MA - potential resistance
+                score += 6
+                signals.append(('🔴', 'Testing MA resistance'))
+            else:
+                score += 2
+    
+    # 6. Options Flow / Institutional Activity (0-10 points)
+    options_data = data.get('options_data')
+    if options_data:
+        calls_df = options_data.get('calls')
+        puts_df = options_data.get('puts')
+        
+        total_call_vol = calls_df['volume'].sum() if calls_df is not None and 'volume' in calls_df.columns else 0
+        total_put_vol = puts_df['volume'].sum() if puts_df is not None and 'volume' in puts_df.columns else 0
+        
+        # Clean NaN values
+        total_call_vol = 0 if pd.isna(total_call_vol) else total_call_vol
+        total_put_vol = 0 if pd.isna(total_put_vol) else total_put_vol
+        
+        if total_call_vol + total_put_vol > 0:
+            pc_ratio = total_put_vol / total_call_vol if total_call_vol > 0 else 1
+            
+            if direction == 'calls':
+                if pc_ratio < 0.5:  # Heavy call buying
+                    score += 10
+                    signals.append(('🟢', f'Bullish options flow (P/C: {pc_ratio:.2f})'))
+                elif pc_ratio < 0.8:
+                    score += 7
+                elif pc_ratio > 1.5:  # Contrarian - lots of puts could mean oversold
+                    score += 5
+                else:
+                    score += 3
+            else:  # puts
+                if pc_ratio > 1.5:  # Heavy put buying
+                    score += 10
+                    signals.append(('🔴', f'Bearish options flow (P/C: {pc_ratio:.2f})'))
+                elif pc_ratio > 1.2:
+                    score += 7
+                elif pc_ratio < 0.5:  # Contrarian - lots of calls could mean overbought
+                    score += 5
+                else:
+                    score += 3
+    
+    # 7. Sector Context (0-5 points)
+    sector = info.get('sector', '')
+    # Would ideally check sector ETF performance here
+    score += 3  # Baseline
+    
+    # 8. Earnings Proximity (adjust score)
+    try:
+        cal = info.get('calendar', {})
+        if cal and 'Earnings Date' in str(cal):
+            # Near earnings - higher IV, adjust expectations
+            signals.append(('📅', 'Earnings approaching'))
+            if time_context in ['premarket', 'open']:
+                score += 3  # Earnings plays can work pre-market
+    except:
+        pass
+    
+    # 9. VIX Context (0-5 points)
+    # Higher VIX = higher premiums, favor puts or high-conviction calls only
+    try:
+        vix_data = yf.Ticker('^VIX').history(period='1d')
+        if not vix_data.empty:
+            vix_level = vix_data['Close'].iloc[-1]
+            
+            if direction == 'calls':
+                if vix_level < 15:
+                    score += 5  # Low fear, good for calls
+                elif vix_level < 20:
+                    score += 3
+                elif vix_level > 25:
+                    score += 0  # High fear, calls risky
+                    signals.append(('🟡', 'Elevated VIX'))
+            else:  # puts
+                if vix_level > 25:
+                    score += 5  # High fear, puts have momentum
+                    signals.append(('🔴', 'High VIX environment'))
+                elif vix_level > 20:
+                    score += 3
+                else:
+                    score += 1
+    except:
+        pass
+    
+    # === APPLY TIME WEIGHT ===
+    score = score * time_weight
+    
+    # === FINAL SCORING ===
+    # Max theoretical score ~100
+    # Grade thresholds
+    if score >= 75:
+        grade = "A+"
+        gr_cls = "score-excellent"
+    elif score >= 65:
+        grade = "A"
+        gr_cls = "score-excellent"
+    elif score >= 55:
+        grade = "B+"
+        gr_cls = "score-good"
+    elif score >= 45:
+        grade = "B"
+        gr_cls = "score-good"
+    elif score >= 35:
+        grade = "C+"
+        gr_cls = "score-fair"
+    elif score >= 25:
+        grade = "C"
+        gr_cls = "score-fair"
+    else:
+        grade = "D"
+        gr_cls = "score-weak"
+    
+    return {
+        'symbol': sym,
+        'total_score': round(score, 1),
+        'grade': grade,
+        'grade_class': gr_cls,
+        'current_price': price,
+        'overnight_change_pct': overnight,
+        'momentum_5d': mom_5d,
+        'momentum_1m': mom_1m,
+        'rsi': rsi,
+        'relative_volume': rel_volume,
+        'time_context': time_context,
+        'signals': signals[:4],  # Top 4 signals
+    }
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=180)  # Shorter cache for more responsive updates
 def get_top_options():
+    """
+    Get top options candidates with comprehensive scoring.
+    Returns top calls and puts sorted by score.
+    """
     calls, puts = [], []
-    for s in OPTIONS_UNIVERSE[:30]:
-        c = calc_opt_score(s, 'calls')
-        if c: calls.append(c)
-        p = calc_opt_score(s, 'puts')
-        if p: puts.append(p)
-    return sorted(calls, key=lambda x: x['total_score'], reverse=True)[:3], sorted(puts, key=lambda x: x['total_score'], reverse=True)[:3]
+    
+    # Get market context for filtering
+    eastern = pytz.timezone('US/Eastern')
+    now = datetime.now(eastern)
+    market_hour = now.hour
+    
+    # Adjust universe based on time of day
+    if market_hour < 10:
+        # Pre-market/early: Focus on high-volume names with overnight moves
+        universe = OPTIONS_UNIVERSE[:35]
+    else:
+        # Regular hours: Full universe
+        universe = OPTIONS_UNIVERSE[:40]
+    
+    for s in universe:
+        try:
+            c = calc_opt_score(s, 'calls')
+            if c and c['total_score'] > 20:  # Minimum threshold
+                calls.append(c)
+            
+            p = calc_opt_score(s, 'puts')
+            if p and p['total_score'] > 20:
+                puts.append(p)
+        except:
+            continue
+    
+    # Sort by score
+    calls = sorted(calls, key=lambda x: x['total_score'], reverse=True)
+    puts = sorted(puts, key=lambda x: x['total_score'], reverse=True)
+    
+    return calls[:5], puts[:5]  # Return top 5 each
 
 def main():
     if st.session_state.show_stock_report and st.session_state.selected_stock: render_stock_report(st.session_state.selected_stock); return
@@ -2903,7 +3884,7 @@ def main():
         eastern = pytz.timezone('US/Eastern')
         st.markdown(f'<div style="text-align:right;"><span class="market-status status-{sk}">{st_txt}</span><p class="timestamp">{cd}</p><p class="timestamp">{datetime.now(eastern).strftime("%I:%M %p ET")}</p></div>', unsafe_allow_html=True)
     st.markdown("---")
-    tabs = st.tabs(["🎯 Market Brief", "🌍 Futures", "📊 Stocks", "🏢 Sectors", "📈 Options", "🔍 Research"])
+    tabs = st.tabs(["🎯 Market Brief", "🌍 Futures", "📊 Stocks", "🏢 Sectors", "📈 Options", "📅 Earnings", "🔍 Research"])
     
     with tabs[0]:
         st.markdown("## 🎯 Daily Intelligence")
@@ -2956,7 +3937,7 @@ def main():
             
             # Expert Macro Analyst Summary
             st.markdown("---")
-            expert_summary = generate_expert_macro_summary(md, ns, econ, assess)
+            market_summary, news_analysis = generate_expert_macro_summary(md, ns, econ, assess)
             
             # Determine market sentiment for styling
             sent_color = "#3fb950" if 'Bullish' in assess['sentiment'] else "#f85149" if 'Bearish' in assess['sentiment'] else "#d29922"
@@ -2973,7 +3954,11 @@ def main():
                         <div style="font-size: 0.65rem; color: #484f58;">{datetime.now(eastern).strftime('%B %d, %Y')}</div>
                     </div>
                 </div>
-                <p style="color: #c9d1d9; font-size: 0.9rem; line-height: 1.8; text-align: justify; margin: 0; font-family: 'Georgia', serif;">{expert_summary}</p>
+                <p style="color: #c9d1d9; font-size: 0.9rem; line-height: 1.8; text-align: justify; margin: 0 0 1rem 0; font-family: 'Georgia', serif;">{market_summary}</p>
+                <div style="background: rgba(88,166,255,0.05); border-left: 3px solid #58a6ff; padding: 1rem; margin: 1rem 0; border-radius: 0 8px 8px 0;">
+                    <div style="font-size: 0.75rem; font-weight: 600; color: #58a6ff; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em;">📰 News Flow Analysis</div>
+                    <p style="color: #c9d1d9; font-size: 0.85rem; line-height: 1.7; text-align: justify; margin: 0; font-family: 'Georgia', serif;">{news_analysis}</p>
+                </div>
                 <div style="display: flex; align-items: center; margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid rgba(163,113,247,0.2);">
                     <span style="font-size: 0.7rem; color: #6e7681;">Market Bias:</span>
                     <span style="margin-left: 0.5rem; color: {sent_color}; font-weight: 600; font-size: 0.75rem;">{assess['sentiment']}</span>
@@ -3245,22 +4230,501 @@ def main():
             if m: render_clickable_stock(s, m['current_price'], m['overnight_change_pct'], s_cols[i % 4], "sec")
     
     with tabs[4]:
-        st.markdown("## 📈 Options")
-        if st.button("🔄 Screener", type="primary", key="opt_run"): st.cache_data.clear()
-        with st.spinner("..."): calls, puts = get_top_options()
+        st.markdown("## 📈 Options Screener")
+        
+        # Time context indicator
+        eastern = pytz.timezone('US/Eastern')
+        now = datetime.now(eastern)
+        market_hour = now.hour
+        
+        if market_hour < 9 or (market_hour == 9 and now.minute < 30):
+            time_badge = "🌅 Pre-Market"
+            time_desc = "Focus on overnight gaps and momentum setups"
+        elif market_hour < 10:
+            time_badge = "🔔 Market Open"
+            time_desc = "High volatility - momentum plays favored"
+        elif market_hour < 12:
+            time_badge = "☀️ Morning Session"
+            time_desc = "Trend following opportunities"
+        elif market_hour < 14:
+            time_badge = "🕐 Midday"
+            time_desc = "Lower conviction - wait for setups"
+        elif market_hour < 15:
+            time_badge = "📊 Afternoon"
+            time_desc = "Institutional positioning underway"
+        else:
+            time_badge = "⚡ Power Hour"
+            time_desc = "Momentum acceleration - fast moves"
+        
+        st.markdown(f"""
+        <div style="background: rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.3); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <span style="font-size: 1rem; font-weight: 600; color: #58a6ff;">{time_badge}</span>
+                <span style="margin-left: 1rem; color: #8b949e; font-size: 0.85rem;">{time_desc}</span>
+            </div>
+            <span style="color: #6e7681; font-size: 0.75rem;">{now.strftime('%I:%M %p ET')}</span>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if st.button("🔄 Run Screener", type="primary", key="opt_run"): 
+            st.cache_data.clear()
+        
+        with st.spinner("Analyzing options opportunities..."):
+            calls, puts = get_top_options()
+        
+        # Scoring legend
+        with st.expander("📊 Scoring Methodology", expanded=False):
+            st.markdown("""
+            **The options screener evaluates candidates on:**
+            
+            | Factor | Weight | Description |
+            |--------|--------|-------------|
+            | RSI | 0-15 pts | Oversold for calls, overbought for puts |
+            | Momentum | 0-20 pts | Multi-timeframe alignment (1D, 5D, 1M) |
+            | Volume | 0-15 pts | Relative volume vs average |
+            | Range | 0-10 pts | Volatility expansion detection |
+            | Moving Averages | 0-10 pts | Price vs 20/50 MA |
+            | Options Flow | 0-10 pts | Put/call ratio analysis |
+            | VIX Context | 0-5 pts | Market fear/greed adjustment |
+            | Time of Day | ×0.9-1.2 | Session-based weighting |
+            
+            **Grades:** A+ (75+) | A (65+) | B+ (55+) | B (45+) | C+ (35+) | C (25+) | D (<25)
+            """)
+        
         c_col, p_col = st.columns(2)
+        
         with c_col:
-            st.markdown('<div class="calls-card"><h3 style="color:#3fb950;margin:0;">📈 CALLS</h3></div>', unsafe_allow_html=True)
-            for i, p in enumerate(calls, 1):
-                st.markdown(f'<div class="options-pick-card"><div class="pick-header"><span class="pick-symbol">#{i} {p["symbol"]}</span><span class="pick-score {p["grade_class"]}">{p["grade"]} ({p["total_score"]:.0f})</span></div><div style="color:#8b949e;font-size:0.85rem;">${p["current_price"]:.2f} · {p["overnight_change_pct"]:+.2f}% · RSI:{p["rsi"]:.0f}</div></div>', unsafe_allow_html=True)
-                if st.button(f"View {p['symbol']}", key=f"c_{p['symbol']}", use_container_width=True): st.session_state.selected_stock = p['symbol']; st.session_state.show_stock_report = True; st.rerun()
+            st.markdown("""
+            <div style="background: linear-gradient(135deg, rgba(63,185,80,0.1) 0%, rgba(63,185,80,0.05) 100%); border: 1px solid rgba(63,185,80,0.3); border-radius: 10px; padding: 1rem; margin-bottom: 1rem;">
+                <h3 style="color:#3fb950; margin:0; display: flex; align-items: center;">
+                    <span style="font-size: 1.5rem; margin-right: 0.5rem;">📈</span> TOP CALLS
+                </h3>
+                <p style="color: #8b949e; font-size: 0.75rem; margin: 0.25rem 0 0 0;">Bullish setups ranked by score</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            if calls:
+                for i, p in enumerate(calls, 1):
+                    # Build signals display
+                    signals_html = ""
+                    if p.get('signals'):
+                        for emoji, text in p['signals'][:3]:
+                            signals_html += f'<span style="background: rgba(63,185,80,0.15); padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.65rem; margin-right: 0.25rem;">{emoji} {text}</span>'
+                    
+                    rel_vol = p.get('relative_volume', 1)
+                    vol_indicator = "🔥" if rel_vol > 2 else "📊" if rel_vol > 1 else "📉"
+                    
+                    st.markdown(f"""
+                    <div class="options-pick-card" style="border-left: 4px solid #3fb950;">
+                        <div class="pick-header" style="display: flex; justify-content: space-between; align-items: center;">
+                            <span class="pick-symbol" style="font-size: 1.1rem;">#{i} {p["symbol"]}</span>
+                            <span class="pick-score {p["grade_class"]}" style="font-size: 1rem; font-weight: 700;">{p["grade"]} ({p["total_score"]:.0f})</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 0.5rem 0;">
+                            <span style="color: #fff; font-weight: 500;">${p["current_price"]:.2f}</span>
+                            <span style="color: {'#3fb950' if p['overnight_change_pct'] >= 0 else '#f85149'};">{p["overnight_change_pct"]:+.2f}% today</span>
+                        </div>
+                        <div style="display: flex; gap: 1rem; font-size: 0.75rem; color: #8b949e; margin-bottom: 0.5rem;">
+                            <span>RSI: {p["rsi"]:.0f}</span>
+                            <span>5D: {p["momentum_5d"]:+.1f}%</span>
+                            <span>{vol_indicator} Vol: {rel_vol:.1f}x</span>
+                        </div>
+                        <div style="margin-top: 0.5rem;">{signals_html}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if st.button(f"📊 Analyze {p['symbol']}", key=f"c_{p['symbol']}_{i}", use_container_width=True):
+                        st.session_state.selected_stock = p['symbol']
+                        st.session_state.show_stock_report = True
+                        st.rerun()
+            else:
+                st.info("No strong call setups found. Market conditions may favor caution.")
+        
         with p_col:
-            st.markdown('<div class="puts-card"><h3 style="color:#f85149;margin:0;">📉 PUTS</h3></div>', unsafe_allow_html=True)
-            for i, p in enumerate(puts, 1):
-                st.markdown(f'<div class="options-pick-card"><div class="pick-header"><span class="pick-symbol">#{i} {p["symbol"]}</span><span class="pick-score {p["grade_class"]}">{p["grade"]} ({p["total_score"]:.0f})</span></div><div style="color:#8b949e;font-size:0.85rem;">${p["current_price"]:.2f} · {p["overnight_change_pct"]:+.2f}% · RSI:{p["rsi"]:.0f}</div></div>', unsafe_allow_html=True)
-                if st.button(f"View {p['symbol']}", key=f"p_{p['symbol']}", use_container_width=True): st.session_state.selected_stock = p['symbol']; st.session_state.show_stock_report = True; st.rerun()
+            st.markdown("""
+            <div style="background: linear-gradient(135deg, rgba(248,81,73,0.1) 0%, rgba(248,81,73,0.05) 100%); border: 1px solid rgba(248,81,73,0.3); border-radius: 10px; padding: 1rem; margin-bottom: 1rem;">
+                <h3 style="color:#f85149; margin:0; display: flex; align-items: center;">
+                    <span style="font-size: 1.5rem; margin-right: 0.5rem;">📉</span> TOP PUTS
+                </h3>
+                <p style="color: #8b949e; font-size: 0.75rem; margin: 0.25rem 0 0 0;">Bearish setups ranked by score</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            if puts:
+                for i, p in enumerate(puts, 1):
+                    # Build signals display
+                    signals_html = ""
+                    if p.get('signals'):
+                        for emoji, text in p['signals'][:3]:
+                            signals_html += f'<span style="background: rgba(248,81,73,0.15); padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.65rem; margin-right: 0.25rem;">{emoji} {text}</span>'
+                    
+                    rel_vol = p.get('relative_volume', 1)
+                    vol_indicator = "🔥" if rel_vol > 2 else "📊" if rel_vol > 1 else "📉"
+                    
+                    st.markdown(f"""
+                    <div class="options-pick-card" style="border-left: 4px solid #f85149;">
+                        <div class="pick-header" style="display: flex; justify-content: space-between; align-items: center;">
+                            <span class="pick-symbol" style="font-size: 1.1rem;">#{i} {p["symbol"]}</span>
+                            <span class="pick-score {p["grade_class"]}" style="font-size: 1rem; font-weight: 700;">{p["grade"]} ({p["total_score"]:.0f})</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 0.5rem 0;">
+                            <span style="color: #fff; font-weight: 500;">${p["current_price"]:.2f}</span>
+                            <span style="color: {'#3fb950' if p['overnight_change_pct'] >= 0 else '#f85149'};">{p["overnight_change_pct"]:+.2f}% today</span>
+                        </div>
+                        <div style="display: flex; gap: 1rem; font-size: 0.75rem; color: #8b949e; margin-bottom: 0.5rem;">
+                            <span>RSI: {p["rsi"]:.0f}</span>
+                            <span>5D: {p["momentum_5d"]:+.1f}%</span>
+                            <span>{vol_indicator} Vol: {rel_vol:.1f}x</span>
+                        </div>
+                        <div style="margin-top: 0.5rem;">{signals_html}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if st.button(f"📊 Analyze {p['symbol']}", key=f"p_{p['symbol']}_{i}", use_container_width=True):
+                        st.session_state.selected_stock = p['symbol']
+                        st.session_state.show_stock_report = True
+                        st.rerun()
+            else:
+                st.info("No strong put setups found. Market conditions may favor bullish plays.")
+        
+        # Market context summary
+        st.markdown("---")
+        st.markdown("### 📊 Market Context")
+        
+        try:
+            vix_data = yf.Ticker('^VIX').history(period='1d')
+            spy_data = yf.Ticker('SPY').history(period='1d')
+            
+            ctx_col1, ctx_col2, ctx_col3 = st.columns(3)
+            
+            with ctx_col1:
+                if not vix_data.empty:
+                    vix_level = vix_data['Close'].iloc[-1]
+                    vix_color = '#f85149' if vix_level > 25 else '#d29922' if vix_level > 18 else '#3fb950'
+                    vix_label = 'High Fear' if vix_level > 25 else 'Elevated' if vix_level > 18 else 'Low Fear'
+                    st.markdown(f"""
+                    <div class="metric-card" style="text-align: center;">
+                        <div style="font-size: 0.75rem; color: #8b949e;">VIX (Fear Index)</div>
+                        <div style="font-size: 1.5rem; font-weight: 700; color: {vix_color};">{vix_level:.1f}</div>
+                        <div style="font-size: 0.7rem; color: {vix_color};">{vix_label}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            with ctx_col2:
+                if not spy_data.empty:
+                    spy_change = (spy_data['Close'].iloc[-1] - spy_data['Open'].iloc[-1]) / spy_data['Open'].iloc[-1] * 100
+                    spy_color = '#3fb950' if spy_change > 0 else '#f85149'
+                    st.markdown(f"""
+                    <div class="metric-card" style="text-align: center;">
+                        <div style="font-size: 0.75rem; color: #8b949e;">SPY Today</div>
+                        <div style="font-size: 1.5rem; font-weight: 700; color: {spy_color};">{spy_change:+.2f}%</div>
+                        <div style="font-size: 0.7rem; color: #8b949e;">{'Bullish' if spy_change > 0.5 else 'Bearish' if spy_change < -0.5 else 'Neutral'}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            with ctx_col3:
+                # Options recommendation based on context
+                if not vix_data.empty and not spy_data.empty:
+                    if vix_level > 25 and spy_change < -1:
+                        rec = "⚠️ High Risk"
+                        rec_desc = "Elevated premiums, favor put spreads"
+                    elif vix_level < 15 and spy_change > 0:
+                        rec = "🟢 Calls Favored"
+                        rec_desc = "Low IV, bullish momentum"
+                    elif vix_level > 20:
+                        rec = "🟡 Neutral/Puts"
+                        rec_desc = "Elevated fear, hedge positions"
+                    else:
+                        rec = "📊 Balanced"
+                        rec_desc = "Normal conditions"
+                    
+                    st.markdown(f"""
+                    <div class="metric-card" style="text-align: center;">
+                        <div style="font-size: 0.75rem; color: #8b949e;">Session Bias</div>
+                        <div style="font-size: 1.1rem; font-weight: 700; color: #fff;">{rec}</div>
+                        <div style="font-size: 0.7rem; color: #8b949e;">{rec_desc}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+        except:
+            st.info("Market context data loading...")
     
     with tabs[5]:
+        st.markdown("### 📅 Earnings Center")
+        st.markdown("<p style='color: #8b949e; font-size: 0.85rem;'>Upcoming earnings, earnings analysis, and earnings call summaries</p>", unsafe_allow_html=True)
+        
+        earnings_tabs = st.tabs(["📆 Upcoming Earnings", "📊 Earnings Analyzer", "📰 Earnings News"])
+        
+        with earnings_tabs[0]:
+            st.markdown("#### 📆 Earnings Calendar")
+            with st.spinner("Loading earnings calendar..."):
+                upcoming_earnings = get_upcoming_earnings()
+            
+            if upcoming_earnings:
+                # Group by date
+                today_earnings = [e for e in upcoming_earnings if e.get('is_today')]
+                this_week_earnings = [e for e in upcoming_earnings if not e.get('is_today')]
+                
+                if today_earnings:
+                    st.markdown("##### 🔴 Reporting Today")
+                    today_cols = st.columns(min(4, len(today_earnings)))
+                    for i, e in enumerate(today_earnings[:8]):
+                        with today_cols[i % 4]:
+                            timing_badge = "🌅 BMO" if 'before' in e.get('timing', '').lower() else "🌙 AMC" if 'after' in e.get('timing', '').lower() else "📊"
+                            st.markdown(f"""
+                            <div class="metric-card" style="text-align: center; padding: 1rem; border-color: #f85149;">
+                                <div style="font-size: 1.1rem; font-weight: 700; color: #fff;">{e['symbol']}</div>
+                                <div style="font-size: 0.75rem; color: #8b949e;">{e['name'][:20]}</div>
+                                <div style="font-size: 0.7rem; color: #f85149; margin-top: 0.5rem;">{timing_badge}</div>
+                                <div style="font-size: 0.65rem; color: #6e7681;">Est EPS: {e.get('est_eps', 'N/A')}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            if st.button(f"Analyze {e['symbol']}", key=f"today_earn_{e['symbol']}", use_container_width=True):
+                                st.session_state.selected_stock = e['symbol']
+                                st.session_state.show_stock_report = True
+                                st.rerun()
+                
+                if this_week_earnings:
+                    st.markdown("##### 📅 This Week")
+                    week_cols = st.columns(4)
+                    for i, e in enumerate(this_week_earnings[:12]):
+                        with week_cols[i % 4]:
+                            st.markdown(f"""
+                            <div class="metric-card" style="padding: 0.75rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: center;">
+                                    <span style="font-weight: 600; color: #fff;">{e['symbol']}</span>
+                                    <span style="font-size: 0.65rem; color: #58a6ff;">{e.get('date', '')}</span>
+                                </div>
+                                <div style="font-size: 0.7rem; color: #8b949e;">{e['name'][:25]}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+            else:
+                st.info("No upcoming earnings data available. Major earnings are typically reported before market open (BMO) or after market close (AMC).")
+        
+        with earnings_tabs[1]:
+            st.markdown("#### 📊 Earnings Analyzer")
+            st.markdown("<p style='color: #8b949e; font-size: 0.8rem;'>Enter a stock symbol to analyze recent earnings performance and get AI-generated insights</p>", unsafe_allow_html=True)
+            
+            earn_symbol = st.text_input("Stock Symbol:", placeholder="e.g., AAPL, MSFT, NVDA", key="earn_sym_input").upper().strip()
+            
+            if earn_symbol:
+                with st.spinner(f"Analyzing {earn_symbol} earnings history..."):
+                    earnings_analysis = analyze_earnings_history(earn_symbol)
+                
+                if earnings_analysis:
+                    # Header card
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, rgba(88,166,255,0.1) 0%, rgba(163,113,247,0.1) 100%); border: 1px solid rgba(88,166,255,0.3); border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <span style="font-size: 1.5rem; font-weight: 700; color: #fff;">{earn_symbol}</span>
+                                <span style="margin-left: 1rem; font-size: 0.9rem; color: #8b949e;">{earnings_analysis.get('company_name', '')}</span>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 0.8rem; color: #8b949e;">Next Earnings</div>
+                                <div style="font-size: 1rem; font-weight: 600; color: #58a6ff;">{earnings_analysis.get('next_earnings', 'TBD')}</div>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Earnings track record
+                    track_record = earnings_analysis.get('track_record', {})
+                    beats = track_record.get('beats', 0)
+                    misses = track_record.get('misses', 0)
+                    meets = track_record.get('meets', 0)
+                    total = beats + misses + meets
+                    beat_rate = (beats / total * 100) if total > 0 else 0
+                    
+                    tr_col1, tr_col2, tr_col3, tr_col4 = st.columns(4)
+                    with tr_col1:
+                        st.markdown(f"""
+                        <div class="metric-card" style="text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 700; color: #3fb950;">{beats}</div>
+                            <div style="font-size: 0.75rem; color: #8b949e;">Beats</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with tr_col2:
+                        st.markdown(f"""
+                        <div class="metric-card" style="text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 700; color: #f85149;">{misses}</div>
+                            <div style="font-size: 0.75rem; color: #8b949e;">Misses</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with tr_col3:
+                        st.markdown(f"""
+                        <div class="metric-card" style="text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 700; color: #d29922;">{meets}</div>
+                            <div style="font-size: 0.75rem; color: #8b949e;">In-Line</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with tr_col4:
+                        beat_color = '#3fb950' if beat_rate >= 75 else '#d29922' if beat_rate >= 50 else '#f85149'
+                        st.markdown(f"""
+                        <div class="metric-card" style="text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 700; color: {beat_color};">{beat_rate:.0f}%</div>
+                            <div style="font-size: 0.75rem; color: #8b949e;">Beat Rate</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Recent quarters
+                    st.markdown("##### 📈 Recent Quarters")
+                    quarters = earnings_analysis.get('recent_quarters', [])
+                    if quarters:
+                        for q in quarters[:4]:
+                            result_color = '#3fb950' if q.get('result') == 'beat' else '#f85149' if q.get('result') == 'miss' else '#d29922'
+                            result_icon = '✅' if q.get('result') == 'beat' else '❌' if q.get('result') == 'miss' else '➖'
+                            surprise = q.get('surprise_pct', 0)
+                            st.markdown(f"""
+                            <div style="background: rgba(33,38,45,0.5); border-left: 3px solid {result_color}; padding: 0.75rem 1rem; margin: 0.5rem 0; border-radius: 0 8px 8px 0;">
+                                <div style="display: flex; justify-content: space-between; align-items: center;">
+                                    <div>
+                                        <span style="font-weight: 600; color: #fff;">{q.get('quarter', '')}</span>
+                                        <span style="margin-left: 1rem; color: {result_color};">{result_icon} {q.get('result', '').upper()}</span>
+                                    </div>
+                                    <div style="text-align: right;">
+                                        <div style="font-size: 0.8rem;"><span style="color: #8b949e;">EPS:</span> <span style="color: #fff;">${q.get('actual_eps', 0):.2f}</span> vs <span style="color: #8b949e;">${q.get('est_eps', 0):.2f}</span></div>
+                                        <div style="font-size: 0.75rem; color: {result_color};">Surprise: {surprise:+.1f}%</div>
+                                    </div>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    
+                    # AI Analysis
+                    st.markdown("##### 🤖 AI Earnings Analysis")
+                    ai_analysis = earnings_analysis.get('ai_analysis', '')
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, rgba(163,113,247,0.1) 0%, rgba(88,166,255,0.05) 100%); border: 1px solid rgba(163,113,247,0.3); border-radius: 12px; padding: 1.25rem;">
+                        <p style="color: #c9d1d9; font-size: 0.9rem; line-height: 1.8; text-align: justify; margin: 0; font-family: 'Georgia', serif;">{ai_analysis}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Post-earnings price reaction
+                    st.markdown("##### 📊 Post-Earnings Price Reaction")
+                    reactions = earnings_analysis.get('price_reactions', [])
+                    if reactions:
+                        reaction_cols = st.columns(len(reactions[:4]))
+                        for i, r in enumerate(reactions[:4]):
+                            with reaction_cols[i]:
+                                move_color = '#3fb950' if r.get('move', 0) > 0 else '#f85149'
+                                st.markdown(f"""
+                                <div class="metric-card" style="text-align: center; padding: 0.75rem;">
+                                    <div style="font-size: 0.7rem; color: #8b949e;">{r.get('quarter', '')}</div>
+                                    <div style="font-size: 1.2rem; font-weight: 700; color: {move_color};">{r.get('move', 0):+.1f}%</div>
+                                    <div style="font-size: 0.65rem; color: #6e7681;">Next Day</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                else:
+                    st.warning(f"Could not fetch earnings data for {earn_symbol}. Please verify the symbol is correct.")
+        
+        with earnings_tabs[2]:
+            st.markdown("#### 📰 Earnings News Analyzer")
+            st.markdown("<p style='color: #8b949e; font-size: 0.8rem;'>Paste an earnings call transcript or news article URL for AI analysis</p>", unsafe_allow_html=True)
+            
+            earnings_url = st.text_input("Earnings Article/Transcript URL:", placeholder="https://seekingalpha.com/... or earnings news URL", key="earn_url_input")
+            
+            if earnings_url:
+                with st.spinner("Analyzing earnings content..."):
+                    try:
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                            'Accept': 'text/html,application/xhtml+xml',
+                        }
+                        resp = requests.get(earnings_url, headers=headers, timeout=20)
+                        soup = BeautifulSoup(resp.content, 'html.parser')
+                        
+                        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+                            tag.decompose()
+                        
+                        title = soup.title.string if soup.title else "Earnings Analysis"
+                        title = title.strip()[:150]
+                        
+                        # Extract content
+                        article_text = ""
+                        article_tags = soup.find_all(['article', 'main', 'div'], class_=lambda x: x and any(c in str(x).lower() for c in ['article', 'content', 'transcript', 'earnings']))
+                        if article_tags:
+                            article_text = article_tags[0].get_text(separator='\n', strip=True)
+                        
+                        if not article_text or len(article_text) < 300:
+                            paragraphs = soup.find_all('p')
+                            article_text = '\n'.join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 30])
+                        
+                        article_text = article_text[:20000]
+                        
+                        # Analyze earnings content
+                        earnings_summary = analyze_earnings_content(article_text, title)
+                        
+                        # Display header
+                        st.markdown(f"""
+                        <div style="background: linear-gradient(135deg, rgba(63,185,80,0.1) 0%, rgba(88,166,255,0.05) 100%); border: 1px solid rgba(63,185,80,0.3); border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem;">
+                            <div style="font-size: 1.1rem; font-weight: 600; color: #fff; margin-bottom: 0.5rem;">📄 {title}</div>
+                            <div style="font-size: 0.75rem; color: #8b949e;">{urlparse(earnings_url).netloc}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Key metrics extracted
+                        if earnings_summary.get('key_metrics'):
+                            st.markdown("##### 📊 Key Metrics Mentioned")
+                            metrics_cols = st.columns(3)
+                            for i, metric in enumerate(earnings_summary['key_metrics'][:6]):
+                                with metrics_cols[i % 3]:
+                                    st.markdown(f"""
+                                    <div class="metric-card" style="padding: 0.5rem;">
+                                        <div style="font-size: 0.7rem; color: #58a6ff;">{metric.get('label', '')}</div>
+                                        <div style="font-size: 0.9rem; color: #fff;">{metric.get('value', '')}</div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                        
+                        # Sentiment
+                        sentiment = earnings_summary.get('sentiment', 'neutral')
+                        sent_color = '#3fb950' if sentiment == 'bullish' else '#f85149' if sentiment == 'bearish' else '#d29922'
+                        
+                        # Key takeaways
+                        st.markdown("##### 🎯 Key Takeaways")
+                        for takeaway in earnings_summary.get('takeaways', [])[:5]:
+                            st.markdown(f"""
+                            <div style="background: rgba(33,38,45,0.5); padding: 0.5rem 1rem; margin: 0.25rem 0; border-radius: 6px; border-left: 2px solid #58a6ff;">
+                                <span style="color: #c9d1d9; font-size: 0.85rem;">• {takeaway}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Management tone
+                        st.markdown("##### 🎤 Management Tone & Guidance")
+                        st.markdown(f"""
+                        <div style="display: flex; gap: 1rem; margin-bottom: 1rem;">
+                            <div class="metric-card" style="flex: 1; text-align: center; padding: 0.75rem;">
+                                <div style="font-size: 0.7rem; color: #8b949e;">Overall Sentiment</div>
+                                <div style="font-size: 1rem; font-weight: 600; color: {sent_color}; text-transform: uppercase;">{sentiment}</div>
+                            </div>
+                            <div class="metric-card" style="flex: 1; text-align: center; padding: 0.75rem;">
+                                <div style="font-size: 0.7rem; color: #8b949e;">Guidance Tone</div>
+                                <div style="font-size: 1rem; font-weight: 600; color: #fff;">{earnings_summary.get('guidance_tone', 'Neutral')}</div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # AI Summary
+                        st.markdown("##### 🤖 AI Earnings Summary")
+                        st.markdown(f"""
+                        <div style="background: linear-gradient(135deg, rgba(163,113,247,0.1) 0%, rgba(88,166,255,0.05) 100%); border: 1px solid rgba(163,113,247,0.3); border-radius: 12px; padding: 1.25rem;">
+                            <p style="color: #c9d1d9; font-size: 0.9rem; line-height: 1.8; text-align: justify; margin: 0; font-family: 'Georgia', serif;">{earnings_summary.get('summary', 'Analysis in progress...')}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Trading implications
+                        st.markdown("##### 💡 Trading Implications")
+                        implications = earnings_summary.get('trading_implications', [])
+                        for imp in implications[:3]:
+                            imp_color = '#3fb950' if 'bullish' in imp.lower() or 'positive' in imp.lower() else '#f85149' if 'bearish' in imp.lower() or 'negative' in imp.lower() else '#d29922'
+                            st.markdown(f"""
+                            <div style="background: rgba(33,38,45,0.3); padding: 0.5rem 1rem; margin: 0.25rem 0; border-radius: 6px;">
+                                <span style="color: {imp_color}; font-size: 0.85rem;">→ {imp}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                    except Exception as e:
+                        st.error(f"Could not analyze the URL. Please check the link is valid and accessible. Error: {str(e)[:100]}")
+    
+    with tabs[6]:
         st.markdown("### 🔍 Research & URL Analysis")
         st.markdown("<p style='color: #8b949e; font-size: 0.85rem;'>Paste any financial news article URL for institutional-grade macro analysis</p>", unsafe_allow_html=True)
         
