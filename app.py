@@ -1091,8 +1091,28 @@ def fetch_stock_data(symbol: str, period: str = "5d", interval: str = "15m") -> 
     try:
         ticker = yf.Ticker(symbol)
         hist = ticker.history(period=period, interval=interval, prepost=False)
-        info = ticker.info or {}
-        return hist, info
+        
+        # If no data, try without prepost
+        if hist is None or hist.empty:
+            hist = ticker.history(period=period, interval=interval)
+        
+        # For futures/indices, if still no data try daily interval
+        if (hist is None or hist.empty) and ('=' in symbol or '^' in symbol):
+            hist = ticker.history(period=period, interval="1d")
+        
+        info = {}
+        try:
+            info = ticker.info or {}
+        except:
+            pass
+        
+        # Validate data
+        if hist is not None and not hist.empty:
+            # Ensure we have valid Close prices
+            if 'Close' in hist.columns and hist['Close'].notna().any():
+                return hist, info
+        
+        return None, {}
     except requests.exceptions.RequestException as e:
         # Network errors
         return None, {}
@@ -1633,35 +1653,57 @@ def calculate_metrics(hist: pd.DataFrame, info: dict) -> Optional[dict]:
     if hist is None or hist.empty: 
         return None
     
-    latest = hist.iloc[-1]
-    price = latest['Close']
-    prev = safe_get(info, 'regularMarketPreviousClose', price)
-    
-    change_pct = safe_pct_change(price, prev)
-    vol = latest['Volume']
-    avg_vol = hist['Volume'].rolling(20).mean().iloc[-1] if len(hist) > 20 else vol
-    vol_vs_avg = safe_div(vol, avg_vol, 1.0) * 100
-    
-    first_close = hist['Close'].iloc[0] if len(hist) > 1 else price
-    momentum = safe_pct_change(price, first_close)
-    
-    rsi, rsi_cond = calculate_rsi(hist['Close'])
-    _, _, _, macd_sig = calculate_macd(hist['Close'])
-    
-    return {
-        'current_price': price, 
-        'prev_close': prev, 
-        'overnight_change': price - prev, 
-        'overnight_change_pct': change_pct, 
-        'volume': vol, 
-        'volume_vs_avg': vol_vs_avg, 
-        'high': latest['High'], 
-        'low': latest['Low'], 
-        'momentum_5d': momentum, 
-        'rsi': rsi, 
-        'rsi_condition': rsi_cond, 
-        'macd_signal': macd_sig
-    }
+    try:
+        latest = hist.iloc[-1]
+        price = float(latest['Close'])
+        
+        # Handle price being 0 or NaN
+        if price <= 0 or pd.isna(price):
+            return None
+        
+        # Try multiple sources for previous close
+        prev = safe_get(info, 'regularMarketPreviousClose', None)
+        if prev is None or prev <= 0:
+            prev = safe_get(info, 'previousClose', None)
+        if prev is None or prev <= 0:
+            # Fall back to yesterday's close from history
+            if len(hist) >= 2:
+                # Get the second to last day's close
+                prev = float(hist['Close'].iloc[-2])
+            else:
+                prev = price  # Last resort
+        
+        # Ensure prev is valid
+        if prev is None or prev <= 0 or pd.isna(prev):
+            prev = price
+        
+        change_pct = safe_pct_change(price, prev)
+        vol = latest['Volume'] if 'Volume' in latest and pd.notna(latest['Volume']) else 0
+        avg_vol = hist['Volume'].rolling(20).mean().iloc[-1] if len(hist) > 20 and 'Volume' in hist else vol
+        vol_vs_avg = safe_div(vol, avg_vol, 1.0) * 100
+        
+        first_close = float(hist['Close'].iloc[0]) if len(hist) > 1 else price
+        momentum = safe_pct_change(price, first_close)
+        
+        rsi, rsi_cond = calculate_rsi(hist['Close'])
+        _, _, _, macd_sig = calculate_macd(hist['Close'])
+        
+        return {
+            'current_price': price, 
+            'prev_close': prev, 
+            'overnight_change': price - prev, 
+            'overnight_change_pct': change_pct, 
+            'volume': vol, 
+            'volume_vs_avg': vol_vs_avg, 
+            'high': float(latest['High']) if 'High' in latest and pd.notna(latest['High']) else price, 
+            'low': float(latest['Low']) if 'Low' in latest and pd.notna(latest['Low']) else price, 
+            'momentum_5d': momentum, 
+            'rsi': rsi, 
+            'rsi_condition': rsi_cond, 
+            'macd_signal': macd_sig
+        }
+    except Exception as e:
+        return None
 
 def generate_detailed_signals(hist, info):
     """Generate institutional-grade detailed technical signals."""
@@ -2356,11 +2398,13 @@ def generate_expert_analysis(symbol, data, signals, support_levels, resistance_l
     # === VOLATILITY REGIME ===
     volatility_regime = 'normal'
     atr_pct = 0
+    atr_value = 0  # Store raw ATR for trade calculations
     hist_volatility = 0
     if len(hist) >= 14:
         high_low = hist['High'] - hist['Low']
         atr = high_low.rolling(14).mean().iloc[-1]
-        atr_pct = (atr / price) * 100 if price > 0 else 0
+        atr_value = float(atr) if pd.notna(atr) else price * 0.02  # Default to 2% of price
+        atr_pct = (atr_value / price) * 100 if price > 0 else 0
         
         # Historical volatility (annualized)
         returns = hist['Close'].pct_change().dropna()
@@ -2373,6 +2417,8 @@ def generate_expert_analysis(symbol, data, signals, support_levels, resistance_l
             volatility_regime = 'elevated'
         elif atr_pct < 1 and hist_volatility < 15:
             volatility_regime = 'compressed'
+    else:
+        atr_value = price * 0.02  # Default to 2% of price if no data
     
     # === MOMENTUM SCORING (Multi-Factor) ===
     momentum_score = 0
@@ -5814,16 +5860,22 @@ def main():
             st.markdown(f'<div class="summary-section"><div class="summary-header">📊 Assessment</div><div style="text-align:center;padding:1rem;"><span class="{cls}">{sent}</span><p style="color:#8b949e;margin:0.5rem 0;font-size:0.8rem;">Bias: {bias.replace("_"," ").title()} · Conf: {conf.title()}</p></div><div class="fear-greed-bar"><div class="fear-greed-indicator" style="left:{score}%;"></div></div><div style="display:flex;justify-content:space-between;font-size:0.7rem;color:#8b949e;"><span>Fear</span><span>Greed</span></div></div>', unsafe_allow_html=True)
         with c2:
             es = md['futures'].get('S&P 500', {})
+            es_price = es.get('current_price', 0)
             ch = es.get('overnight_change_pct', 0)
-            st.markdown(f'<div class="metric-card"><div class="metric-label">S&P Futures</div><div class="metric-value">${es.get("current_price", 0):,.2f}</div><div class="{"positive" if ch >= 0 else "negative"}">{ch:+.2f}%</div></div>', unsafe_allow_html=True)
+            price_display = f"${es_price:,.2f}" if es_price > 0 else "Loading..."
+            st.markdown(f'<div class="metric-card"><div class="metric-label">S&P Futures</div><div class="metric-value">{price_display}</div><div class="{"positive" if ch >= 0 else "negative"}">{ch:+.2f}%</div></div>', unsafe_allow_html=True)
         with c3:
             nq = md['futures'].get('Nasdaq 100', {})
+            nq_price = nq.get('current_price', 0)
             ch = nq.get('overnight_change_pct', 0)
-            st.markdown(f'<div class="metric-card"><div class="metric-label">Nasdaq Futures</div><div class="metric-value">${nq.get("current_price", 0):,.2f}</div><div class="{"positive" if ch >= 0 else "negative"}">{ch:+.2f}%</div></div>', unsafe_allow_html=True)
+            price_display = f"${nq_price:,.2f}" if nq_price > 0 else "Loading..."
+            st.markdown(f'<div class="metric-card"><div class="metric-label">Nasdaq Futures</div><div class="metric-value">{price_display}</div><div class="{"positive" if ch >= 0 else "negative"}">{ch:+.2f}%</div></div>', unsafe_allow_html=True)
         with c4:
             vix = md['futures'].get('VIX', {})
             vl, vc = vix.get('current_price', 0), vix.get('overnight_change_pct', 0)
-            st.markdown(f'<div class="metric-card"><div class="metric-label">VIX</div><div class="metric-value {"negative" if vl > 20 else "positive" if vl < 15 else "neutral"}">{vl:.2f}</div><div class="{"positive" if vc <= 0 else "negative"}">{vc:+.2f}%</div></div>', unsafe_allow_html=True)
+            vix_display = f"{vl:.2f}" if vl > 0 else "Loading..."
+            vix_class = "negative" if vl > 20 else "positive" if vl < 15 and vl > 0 else "neutral"
+            st.markdown(f'<div class="metric-card"><div class="metric-label">VIX</div><div class="metric-value {vix_class}">{vix_display}</div><div class="{"positive" if vc <= 0 else "negative"}">{vc:+.2f}%</div></div>', unsafe_allow_html=True)
         st.markdown("### 📉 Economic Indicators")
         ec_cols = st.columns(4)
         for i, (n, d) in enumerate(list(econ.items())[:4]):
