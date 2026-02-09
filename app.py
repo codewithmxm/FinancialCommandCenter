@@ -1,41 +1,41 @@
 """
-Pre-Market Command Center v8.3
+Pre-Market Command Center v8.4
 Institutional-Grade Market Prep Dashboard
-AI Expert Analysis · Earnings Intelligence · Whale Tracker · Support/Resistance
+AI Expert Analysis · Earnings Intelligence · Whale Tracker · Risk Turbulence
+
+v8.4 Updates:
+- NEW TAB: 🌊 Risk Turbulence & Convergence Early Warning
+  * Institutional-grade Mahalanobis turbulence model
+  * Robust covariance estimation (shrinkage, EWMA, blend)
+  * Detects correlation regime breaks via:
+    - Avg absolute correlation (diversification breakdown)
+    - Correlation matrix jump norm (regime break)
+    - PC1 eigen concentration (one-factor dominance)
+    - Covariance magnitude (system-wide vol expansion)
+  * "Calm-before-storm" detector (high corr + low vol + implied complacency)
+  * Uses ONLY free data sources (yfinance for all prices)
+  * Credit stress proxy via HYG-LQD spread (no FRED API required)
+  * Configurable universe, windows, weights, and alert thresholds
+  * Institutional alerts for rapid deterioration
+  * Color-coded regime bands (GREEN/YELLOW/ORANGE/RED)
 
 v8.3 Updates:
-- WORLD-CLASS AI Expert Analysis completely redesigned:
-  * Multi-timeframe trend analysis
-  * Momentum factor scoring with weighted signals
-  * Volatility regime assessment (high/elevated/normal/compressed)
-  * Risk/reward quantification with probability weighting
-  * Smart Money Score integration
-  * Institutional flow synthesis
-  * Trade parameters with entry zones, stops, targets
-  * Position sizing recommendations
-- All news articles now CLICKABLE with embedded links (↗ indicator)
+- WORLD-CLASS AI Expert Analysis completely redesigned
+- All news articles now CLICKABLE with embedded links
 - Enhanced Bloomberg Terminal-style analysis presentation
-- Momentum factor breakdown with individual scores
-- Full institutional analysis report in expandable section
 
 v8.2 Updates:
 - Fixed futures/indices data loading (NQ=F, ES=F, etc.)
-- Enhanced institutional activity analysis with:
-  * Smart Money Score (0-100)
-  * Squeeze Potential indicator
-  * Accumulation/Distribution phase detection
-  * Institutional Momentum signals
-  * Enhanced dark pool sentiment analysis
-- Improved chart data cleaning (more lenient, handles edge cases)
-- Added None checks for chart rendering
+- Enhanced institutional activity analysis
 
 Features:
-- 🐋 Institutional Activity & Whale Tracker (enhanced)
+- 🐋 Institutional Activity & Whale Tracker
 - 📅 Earnings Center (calendar, analyzer, news)
 - 📰 News Flow Analysis with clickable links
-- 📈 Advanced Options Screener with time-of-day weighting
+- 📈 Advanced Options Screener
 - 🎯 AI-generated institutional-grade analysis
 - 🧠 Smart Money indicators
+- 🌊 Risk Turbulence & Convergence Early Warning (NEW)
 """
 
 import streamlit as st
@@ -243,6 +243,823 @@ CACHE_SHORT = 120    # 2 minutes - real-time data
 CACHE_MEDIUM = 300   # 5 minutes - moderate updates
 CACHE_LONG = 600     # 10 minutes - slower updates
 CACHE_VERY_LONG = 1800  # 30 minutes - rarely changing data
+
+# =====================================================
+# RISK TURBULENCE & CONVERGENCE MODEL (PRO)
+# Institutional-grade covariance turbulence early warning
+# Uses ONLY free data sources (yfinance)
+# =====================================================
+
+# Default turbulence model configuration
+TURB_DEFAULT_CONFIG = {
+    'min_points': 300,
+    'cov_window': 252,          # 1 year covariance estimation
+    'mean_window': 252,         # 1 year mean estimation
+    'corr_window': 60,          # 3 month correlation window
+    'vol_window': 20,           # 1 month realized vol window
+    'pct_window': 504,          # 2 year rolling percentiles
+    'smooth': 5,                # composite score smoothing
+    'ewma_lambda': 0.94,        # EWMA decay factor
+    'shrink_floor': 0.05,       # minimum shrinkage
+    'shrink_cap': 0.60,         # maximum shrinkage
+    'ridge_eps': 1e-6,          # numerical stability
+    'logistic_k': 1.35,         # score mapping steepness
+    'clip_z': 4.0,              # z-score clipping
+    'winsor_p': 0.01,           # winsorization percentile
+    # Composite weights (auto-normalized)
+    'w_turb': 1.7,              # Mahalanobis turbulence
+    'w_corr': 1.1,              # avg abs correlation
+    'w_corr_jump': 1.0,         # correlation matrix jump
+    'w_pc1': 1.1,               # eigen concentration
+    'w_cov_mag': 1.0,           # covariance magnitude
+    'w_vol': 0.7,               # realized vol
+    'w_credit': 1.0,            # credit stress (HYG-LQD spread)
+    'w_decouple': 0.9,          # calm-before-storm detector
+    # Alert thresholds
+    'alert_score_jump_5d': 8.0,
+    'alert_score_level': 70.0,
+    'alert_turb_pct': 0.90,
+    'alert_corr_pct': 0.90,
+    'alert_vol_pct_max': 0.40,
+}
+
+# Default universe (liquid, diversified, free via yfinance)
+TURB_DEFAULT_UNIVERSE = [
+    "SPY",      # US large cap equities
+    "QQQ",      # US tech/growth
+    "IWM",      # US small cap
+    "TLT",      # Long-term treasuries
+    "IEF",      # Intermediate treasuries
+    "GLD",      # Gold
+    "USO",      # Oil proxy
+    "UUP",      # USD index proxy
+    "HYG",      # High yield credit
+    "LQD",      # Investment grade credit
+    "BTC-USD",  # Crypto risk proxy
+]
+
+def turb_resample_bday(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample dataframe to business days with forward fill."""
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    idx = pd.date_range(df.index.min(), df.index.max(), freq="B")
+    return df.reindex(idx).ffill()
+
+def turb_winsorize(s: pd.Series, p: float) -> pd.Series:
+    """Winsorize series at percentile p and 1-p."""
+    if s.dropna().empty:
+        return s
+    lo = s.quantile(p)
+    hi = s.quantile(1 - p)
+    return s.clip(lo, hi)
+
+def turb_zscore_rolling(s: pd.Series, window: int, winsor_p: float) -> pd.Series:
+    """Rolling z-score with winsorization."""
+    s2 = turb_winsorize(s.astype(float), winsor_p)
+    m = s2.rolling(window, min_periods=int(window * 0.5)).mean()
+    sd = s2.rolling(window, min_periods=int(window * 0.5)).std(ddof=0).replace(0, np.nan)
+    return (s2 - m) / sd
+
+def turb_logistic_0_100(z: pd.Series, k: float, clip: float) -> pd.Series:
+    """Map z-score to 0-100 via logistic function."""
+    zc = z.clip(-clip, clip)
+    return 100.0 / (1.0 + np.exp(-k * zc))
+
+def turb_rolling_percentile(series: pd.Series, window: int) -> pd.Series:
+    """Calculate rolling percentile rank."""
+    def _pct(x: np.ndarray) -> float:
+        if len(x) < 5 or np.all(np.isnan(x)):
+            return np.nan
+        v = x[-1]
+        xs = x[~np.isnan(x)]
+        if len(xs) == 0:
+            return np.nan
+        return float(np.mean(xs <= v))
+    return series.rolling(window, min_periods=int(window * 0.3)).apply(_pct, raw=True)
+
+def turb_avg_abs_corr(returns: pd.DataFrame) -> float:
+    """Calculate average absolute correlation across assets."""
+    c = returns.corr()
+    vals = c.values
+    n = vals.shape[0]
+    if n < 2:
+        return np.nan
+    triu = vals[np.triu_indices(n, k=1)]
+    return float(np.nanmean(np.abs(triu)))
+
+def turb_corr_matrix_jump_norm(c1: np.ndarray, c0: np.ndarray) -> float:
+    """Frobenius norm of correlation matrix change (regime break detection)."""
+    if c1.shape != c0.shape:
+        return np.nan
+    diff = c1 - c0
+    return float(np.sqrt(np.nansum(diff * diff)))
+
+def turb_pc1_share_from_cov(cov: np.ndarray) -> float:
+    """Eigen concentration: PC1 explained share of total variance."""
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+        return np.nan
+    try:
+        vals = np.linalg.eigvalsh(cov)
+    except np.linalg.LinAlgError:
+        return np.nan
+    vals = np.clip(vals, 0, np.inf)
+    s = float(np.sum(vals))
+    if s <= 0:
+        return np.nan
+    return float(np.max(vals) / s)
+
+def turb_add_ridge(cov: np.ndarray, ridge_scale: float) -> np.ndarray:
+    """Add ridge regularization for numerical stability."""
+    d = np.nanmean(np.diag(cov))
+    if not np.isfinite(d) or d <= 0:
+        d = 1.0
+    return cov + np.eye(cov.shape[0]) * (ridge_scale * d)
+
+def turb_cov_shrink_to_diag(sample_cov: np.ndarray, shrink: float, ridge_eps: float) -> np.ndarray:
+    """Shrink sample covariance toward diagonal target."""
+    S = sample_cov.copy()
+    S = turb_add_ridge(S, ridge_eps)
+    D = np.diag(np.diag(S))
+    return (1.0 - shrink) * S + shrink * D
+
+def turb_choose_shrinkage(sample_cov: np.ndarray, floor: float, cap: float) -> float:
+    """Condition-aware heuristic shrinkage selection."""
+    try:
+        cond = np.linalg.cond(sample_cov)
+    except np.linalg.LinAlgError:
+        cond = 1e6
+    x = (min(max(cond, 1.0), 1000.0) - 30.0) / 300.0
+    shrink = floor + (cap - floor) * float(np.clip(x, 0.0, 1.0))
+    return float(shrink)
+
+def turb_cov_ewma(returns_window: np.ndarray, lam: float, ridge_eps: float) -> np.ndarray:
+    """EWMA covariance estimation."""
+    X = returns_window.copy()
+    X = X - np.nanmean(X, axis=0, keepdims=True)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    T, N = X.shape
+    C = np.eye(N) * 1e-6
+    for i in range(T):
+        r = X[i : i + 1].T
+        C = lam * C + (1.0 - lam) * (r @ r.T)
+    C = turb_add_ridge(C, ridge_eps)
+    return C
+
+def turb_cov_blend(sample_cov: np.ndarray, ewma_cov: np.ndarray, shrink_cov: np.ndarray) -> np.ndarray:
+    """Blend three covariance estimates: 40% shrink, 40% ewma, 20% sample."""
+    C = 0.40 * shrink_cov + 0.40 * ewma_cov + 0.20 * turb_add_ridge(sample_cov, 1e-6)
+    return C
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_turbulence_prices(tickers: tuple, period: str = "5y") -> pd.DataFrame:
+    """Fetch price data for turbulence model universe."""
+    try:
+        data = yf.download(
+            tickers=list(tickers),
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+        if isinstance(data.columns, pd.MultiIndex):
+            closes = data.xs("Close", axis=1, level=1)
+        else:
+            closes = data[["Close"]].copy()
+            closes.columns = [tickers[0]]
+        closes.index = pd.to_datetime(closes.index)
+        closes = turb_resample_bday(closes)
+        # Drop columns with too many missing values
+        keep = [c for c in closes.columns if closes[c].notna().mean() > 0.80]
+        return closes[keep]
+    except Exception as e:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def compute_turbulence_model(prices_json: str, cfg: dict) -> dict:
+    """
+    Compute full turbulence model.
+    
+    Returns dict with:
+    - metrics: DataFrame with scores, regime, alerts
+    - diagnostics: DataFrame with raw indicators and z-scores
+    """
+    import math
+    
+    # Deserialize prices
+    prices = pd.read_json(prices_json, orient='split')
+    prices.index = pd.to_datetime(prices.index)
+    
+    if len(prices) < cfg['min_points']:
+        return {'error': f"Insufficient data: {len(prices)} points, need {cfg['min_points']}"}
+    
+    # Calculate log returns
+    rets = np.log(prices).diff()
+    idx = prices.index
+    
+    # Credit stress proxy: HYG-LQD spread (free, no FRED required)
+    credit_spread = pd.Series(index=idx, dtype=float)
+    if 'HYG' in prices.columns and 'LQD' in prices.columns:
+        # Normalize and compute spread (higher = more stress)
+        hyg_ret = rets['HYG'].rolling(cfg['vol_window']).std() * np.sqrt(252)
+        lqd_ret = rets['LQD'].rolling(cfg['vol_window']).std() * np.sqrt(252)
+        credit_spread = (hyg_ret - lqd_ret).fillna(0) * 100  # Convert to pseudo-spread
+        credit_spread = credit_spread.clip(-5, 10)  # Reasonable bounds
+    
+    # VIX for implied vol (already in prices if available)
+    vix = pd.Series(index=idx, dtype=float)
+    if '^VIX' in prices.columns:
+        vix = prices['^VIX']
+    
+    # Realized vol (system average)
+    rv = rets.rolling(cfg['vol_window']).std(ddof=0) * np.sqrt(252)
+    avg_rv = rv.mean(axis=1).rename("AVG_REALIZED_VOL")
+    
+    # Initialize diagnostic series
+    turb = pd.Series(index=idx, dtype=float, name="TURBULENCE")
+    cov_trace = pd.Series(index=idx, dtype=float, name="COV_TRACE")
+    cov_frob = pd.Series(index=idx, dtype=float, name="COV_FROBENIUS")
+    pc1_share = pd.Series(index=idx, dtype=float, name="PC1_SHARE")
+    corr_jump = pd.Series(index=idx, dtype=float, name="CORR_JUMP_NORM")
+    avg_abs_corr = pd.Series(index=idx, dtype=float, name="AVG_ABS_CORR")
+    
+    prev_corr = None
+    cov_mode = cfg.get('cov_mode', 'blend')
+    
+    # Main computation loop
+    for t in range(cfg['cov_window'], len(idx)):
+        end = idx[t]
+        win_idx = idx[t - cfg['cov_window'] : t]
+        rwin_df = rets.loc[win_idx].dropna(how='all')
+        
+        if rwin_df.shape[0] < int(cfg['cov_window'] * 0.7):
+            continue
+        
+        # Fill NaN with 0 for computation
+        rwin_df = rwin_df.fillna(0)
+        
+        # Mean estimation
+        mu_idx = idx[max(0, t - cfg['mean_window']) : t]
+        mu_df = rets.loc[mu_idx].fillna(0)
+        mu = mu_df.mean(axis=0).values
+        
+        X = rwin_df.values
+        
+        try:
+            sample_cov = np.cov(X, rowvar=False, ddof=0)
+            if sample_cov.ndim == 0:
+                sample_cov = np.array([[sample_cov]])
+        except Exception:
+            continue
+        
+        # Robust covariance estimation
+        shrink = turb_choose_shrinkage(sample_cov, cfg['shrink_floor'], cfg['shrink_cap'])
+        shrink_cov = turb_cov_shrink_to_diag(sample_cov, shrink=shrink, ridge_eps=cfg['ridge_eps'])
+        ewma_cov = turb_cov_ewma(X, lam=cfg['ewma_lambda'], ridge_eps=cfg['ridge_eps'])
+        
+        if cov_mode == "shrink":
+            cov = shrink_cov
+        elif cov_mode == "ewma":
+            cov = ewma_cov
+        else:
+            cov = turb_cov_blend(sample_cov, ewma_cov, shrink_cov)
+        
+        # Mahalanobis turbulence
+        x = rets.loc[end].fillna(0).values
+        diff = x - mu
+        
+        try:
+            inv = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            inv = np.linalg.pinv(cov)
+        
+        md2 = float(diff.T @ inv @ diff)
+        turb.iloc[t] = math.sqrt(max(md2, 0.0))
+        
+        # Covariance diagnostics
+        cov_trace.iloc[t] = float(np.trace(cov))
+        cov_frob.iloc[t] = float(np.linalg.norm(cov, ord="fro"))
+        pc1_share.iloc[t] = turb_pc1_share_from_cov(cov)
+        
+        # Average absolute correlation
+        avg_abs_corr.iloc[t] = turb_avg_abs_corr(rwin_df.iloc[-cfg['corr_window']:])
+        
+        # Correlation matrix and jump
+        diag = np.sqrt(np.clip(np.diag(cov), 1e-12, np.inf))
+        denom = np.outer(diag, diag)
+        corr = cov / denom
+        corr = np.clip(corr, -1.0, 1.0)
+        
+        if prev_corr is not None and corr.shape == prev_corr.shape:
+            corr_jump.iloc[t] = turb_corr_matrix_jump_norm(corr, prev_corr)
+        prev_corr = corr
+    
+    # Build diagnostics DataFrame
+    diag = pd.DataFrame(index=idx)
+    diag["TURBULENCE"] = turb
+    diag["AVG_ABS_CORR"] = avg_abs_corr
+    diag["CORR_JUMP_NORM"] = corr_jump
+    diag["PC1_SHARE"] = pc1_share
+    diag["COV_TRACE"] = cov_trace
+    diag["COV_FROBENIUS"] = cov_frob
+    diag["AVG_REALIZED_VOL"] = avg_rv
+    diag["CREDIT_SPREAD"] = credit_spread
+    diag["VIX"] = vix
+    
+    # Implied vs realized mismatch
+    vix_ann = (vix / 100.0) if vix.notna().any() else pd.Series(index=idx, dtype=float)
+    diag["IMPL_MINUS_REAL"] = (vix_ann - avg_rv)
+    
+    # Rolling percentiles
+    pw = cfg['pct_window']
+    diag["TURB_PCT"] = turb_rolling_percentile(diag["TURBULENCE"], pw)
+    diag["CORR_PCT"] = turb_rolling_percentile(diag["AVG_ABS_CORR"], pw)
+    diag["CJUMP_PCT"] = turb_rolling_percentile(diag["CORR_JUMP_NORM"], pw)
+    diag["PC1_PCT"] = turb_rolling_percentile(diag["PC1_SHARE"], pw)
+    diag["COVMAG_PCT"] = turb_rolling_percentile(diag["COV_FROBENIUS"], pw)
+    diag["VOL_PCT"] = turb_rolling_percentile(diag["AVG_REALIZED_VOL"], pw)
+    diag["CREDIT_PCT"] = turb_rolling_percentile(diag["CREDIT_SPREAD"], pw)
+    if vix.notna().any():
+        diag["VIX_PCT"] = turb_rolling_percentile(diag["VIX"], pw)
+    
+    # Z-scores for score mapping
+    z = pd.DataFrame(index=idx)
+    z["z_turb"] = turb_zscore_rolling(diag["TURBULENCE"], pw, cfg['winsor_p'])
+    z["z_corr"] = turb_zscore_rolling(diag["AVG_ABS_CORR"], pw, cfg['winsor_p'])
+    z["z_cjump"] = turb_zscore_rolling(diag["CORR_JUMP_NORM"], pw, cfg['winsor_p'])
+    z["z_pc1"] = turb_zscore_rolling(diag["PC1_SHARE"], pw, cfg['winsor_p'])
+    z["z_covmag"] = turb_zscore_rolling(diag["COV_FROBENIUS"], pw, cfg['winsor_p'])
+    z["z_vol"] = turb_zscore_rolling(diag["AVG_REALIZED_VOL"], pw, cfg['winsor_p'])
+    z["z_credit"] = turb_zscore_rolling(diag["CREDIT_SPREAD"], pw, cfg['winsor_p'])
+    z["z_impl_mismatch"] = turb_zscore_rolling(diag["IMPL_MINUS_REAL"].fillna(0), pw, cfg['winsor_p'])
+    
+    # Decoupling detector (calm-before-storm)
+    corr_high = diag["CORR_PCT"].fillna(0.5)
+    vol_low = 1.0 - diag["VOL_PCT"].fillna(0.5)
+    vix_low = (1.0 - diag.get("VIX_PCT", pd.Series(index=idx, dtype=float)).fillna(0.5))
+    mismatch01 = 1.0 / (1.0 + np.exp(-1.0 * z["z_impl_mismatch"].clip(-cfg['clip_z'], cfg['clip_z'])))
+    decouple01 = (0.45 * corr_high + 0.30 * vol_low + 0.25 * vix_low) * (0.6 + 0.4 * mismatch01)
+    diag["DECOUPLE_0_1"] = decouple01.clip(0, 1)
+    
+    # Sub-scores (0-100)
+    sub = pd.DataFrame(index=idx)
+    sub["TURB_SCORE"] = turb_logistic_0_100(z["z_turb"], cfg['logistic_k'], cfg['clip_z'])
+    sub["CORR_SCORE"] = turb_logistic_0_100(z["z_corr"], cfg['logistic_k'], cfg['clip_z'])
+    sub["CORR_JUMP_SCORE"] = turb_logistic_0_100(z["z_cjump"], cfg['logistic_k'], cfg['clip_z'])
+    sub["PC1_SCORE"] = turb_logistic_0_100(z["z_pc1"], cfg['logistic_k'], cfg['clip_z'])
+    sub["COVMAG_SCORE"] = turb_logistic_0_100(z["z_covmag"], cfg['logistic_k'], cfg['clip_z'])
+    sub["VOL_SCORE"] = turb_logistic_0_100(z["z_vol"], cfg['logistic_k'], cfg['clip_z'])
+    sub["CREDIT_SCORE"] = turb_logistic_0_100(z["z_credit"], cfg['logistic_k'], cfg['clip_z'])
+    sub["DECOUPLE_SCORE"] = diag["DECOUPLE_0_1"] * 100.0
+    
+    # Composite score (weighted average, auto-normalized)
+    weights = {
+        "TURB_SCORE": cfg['w_turb'],
+        "CORR_SCORE": cfg['w_corr'],
+        "CORR_JUMP_SCORE": cfg['w_corr_jump'],
+        "PC1_SCORE": cfg['w_pc1'],
+        "COVMAG_SCORE": cfg['w_cov_mag'],
+        "VOL_SCORE": cfg['w_vol'],
+        "CREDIT_SCORE": cfg['w_credit'],
+        "DECOUPLE_SCORE": cfg['w_decouple'],
+    }
+    
+    available = [k for k in weights if k in sub.columns and sub[k].notna().any()]
+    wsum = sum(weights[k] for k in available) if available else 1.0
+    
+    comp = None
+    contrib = pd.DataFrame(index=idx)
+    for k in available:
+        s = sub[k].ffill().fillna(50.0)
+        w = weights[k] / wsum
+        comp = s * w if comp is None else comp + s * w
+        contrib[k.replace("_SCORE", "_CONTRIB")] = s * w
+    
+    sub["RISK_TURBULENCE_SCORE"] = comp.rolling(cfg['smooth']).mean() if comp is not None else pd.Series(50.0, index=idx)
+    sub["SCORE_5D_CHG"] = sub["RISK_TURBULENCE_SCORE"].diff(5)
+    sub["SCORE_1M_CHG"] = sub["RISK_TURBULENCE_SCORE"].diff(21)
+    
+    # Regime labels
+    score = sub["RISK_TURBULENCE_SCORE"]
+    regime = pd.Series(index=idx, dtype=object)
+    regime[score < 35] = "GREEN"
+    regime[(score >= 35) & (score < 55)] = "YELLOW"
+    regime[(score >= 55) & (score < 70)] = "ORANGE"
+    regime[score >= 70] = "RED"
+    sub["REGIME"] = regime
+    
+    # Alerts
+    alerts = pd.Series(index=idx, dtype=object)
+    turb_pct = diag["TURB_PCT"]
+    corr_pct = diag["CORR_PCT"]
+    vol_pct = diag["VOL_PCT"]
+    s5 = sub["SCORE_5D_CHG"]
+    
+    for i in range(len(idx)):
+        msg = []
+        if pd.notna(s5.iloc[i]) and float(s5.iloc[i]) >= cfg['alert_score_jump_5d']:
+            msg.append(f"Score jump ≥{cfg['alert_score_jump_5d']:.0f} in 5d")
+        if pd.notna(score.iloc[i]) and float(score.iloc[i]) >= cfg['alert_score_level']:
+            msg.append(f"Score ≥{cfg['alert_score_level']:.0f}")
+        if pd.notna(turb_pct.iloc[i]) and float(turb_pct.iloc[i]) >= cfg['alert_turb_pct']:
+            msg.append("Turbulence ≥90th pct")
+        if (pd.notna(corr_pct.iloc[i]) and float(corr_pct.iloc[i]) >= cfg['alert_corr_pct'] and
+            pd.notna(vol_pct.iloc[i]) and float(vol_pct.iloc[i]) <= cfg['alert_vol_pct_max']):
+            msg.append("⚠️ CALM-BEFORE-STORM: high corr + low vol")
+        alerts.iloc[i] = " | ".join(msg) if msg else ""
+    
+    sub["ALERTS"] = alerts
+    
+    # Combine outputs
+    metrics = pd.concat([sub, contrib], axis=1)
+    diagnostics = pd.concat([diag, z.add_prefix("Z_")], axis=1)
+    
+    return {
+        'metrics': metrics.to_json(orient='split', date_format='iso'),
+        'diagnostics': diagnostics.to_json(orient='split', date_format='iso'),
+    }
+
+def render_turbulence_tab(st_module):
+    """Render the Risk Turbulence & Convergence tab."""
+    st_module.markdown("### 🌊 Risk Turbulence & Convergence Early Warning")
+    st_module.markdown("<p style='color: #8b949e; font-size: 0.85rem;'>Institutional-grade covariance turbulence model detecting correlation regime breaks, diversification breakdown, and calm-before-storm conditions.</p>", unsafe_allow_html=True)
+    
+    # Settings expander - values persist in session state automatically
+    with st_module.expander("⚙️ Model Settings", expanded=False):
+        st_module.markdown("**Universe & Data**")
+        cfg_cols = st_module.columns(2)
+        with cfg_cols[0]:
+            universe_input = st_module.text_area(
+                "Universe (comma-separated tickers):",
+                value=", ".join(TURB_DEFAULT_UNIVERSE),
+                height=68,
+                key="turb_universe"
+            )
+        with cfg_cols[1]:
+            cov_mode = st_module.selectbox(
+                "Covariance Estimation Mode:",
+                options=["blend", "shrink", "ewma"],
+                index=0,
+                key="turb_cov_mode"
+            )
+            data_period = st_module.selectbox(
+                "Historical Data Period:",
+                options=["3y", "5y", "7y"],
+                index=1,
+                key="turb_period"
+            )
+        
+        st_module.markdown("**Windows (Trading Days)**")
+        win_cols = st_module.columns(4)
+        with win_cols[0]:
+            cov_window = st_module.number_input("Cov Window", min_value=60, max_value=504, value=252, step=21, key="turb_cov_win")
+        with win_cols[1]:
+            corr_window = st_module.number_input("Corr Window", min_value=20, max_value=126, value=60, step=5, key="turb_corr_win")
+        with win_cols[2]:
+            vol_window = st_module.number_input("Vol Window", min_value=5, max_value=63, value=20, step=5, key="turb_vol_win")
+        with win_cols[3]:
+            smooth = st_module.number_input("Smooth Factor", min_value=1, max_value=21, value=5, step=1, key="turb_smooth")
+        
+        st_module.markdown("**Component Weights** (higher = more influence)")
+        w_cols = st_module.columns(4)
+        with w_cols[0]:
+            w_turb = st_module.slider("Turbulence", 0.0, 3.0, 1.7, 0.1, key="w_turb")
+            w_corr = st_module.slider("Correlation", 0.0, 3.0, 1.1, 0.1, key="w_corr")
+        with w_cols[1]:
+            w_pc1 = st_module.slider("PC1 Concentration", 0.0, 3.0, 1.1, 0.1, key="w_pc1")
+            w_cjump = st_module.slider("Corr Jump", 0.0, 3.0, 1.0, 0.1, key="w_cjump")
+        with w_cols[2]:
+            w_vol = st_module.slider("Realized Vol", 0.0, 3.0, 0.7, 0.1, key="w_vol")
+            w_credit = st_module.slider("Credit Stress", 0.0, 3.0, 1.0, 0.1, key="w_credit")
+        with w_cols[3]:
+            w_covmag = st_module.slider("Cov Magnitude", 0.0, 3.0, 1.0, 0.1, key="w_covmag")
+            w_decouple = st_module.slider("Decoupling", 0.0, 3.0, 0.9, 0.1, key="w_decouple")
+        
+        st_module.markdown("**Alert Thresholds**")
+        alert_cols = st_module.columns(4)
+        with alert_cols[0]:
+            alert_score_level = st_module.number_input("Score Alert ≥", value=70.0, step=5.0, key="alert_score")
+        with alert_cols[1]:
+            alert_score_jump = st_module.number_input("5D Jump Alert ≥", value=8.0, step=1.0, key="alert_jump")
+        with alert_cols[2]:
+            alert_turb_pct = st_module.number_input("Turb Pct Alert ≥", value=0.90, step=0.05, key="alert_turb")
+        with alert_cols[3]:
+            alert_corr_pct = st_module.number_input("Corr Pct Alert ≥", value=0.90, step=0.05, key="alert_corr")
+    
+    # Get values from session state (widgets automatically persist)
+    universe_input = st_module.session_state.get('turb_universe', ", ".join(TURB_DEFAULT_UNIVERSE))
+    cov_mode = st_module.session_state.get('turb_cov_mode', 'blend')
+    data_period = st_module.session_state.get('turb_period', '5y')
+    cov_window = st_module.session_state.get('turb_cov_win', 252)
+    corr_window = st_module.session_state.get('turb_corr_win', 60)
+    vol_window = st_module.session_state.get('turb_vol_win', 20)
+    smooth = st_module.session_state.get('turb_smooth', 5)
+    w_turb = st_module.session_state.get('w_turb', 1.7)
+    w_corr = st_module.session_state.get('w_corr', 1.1)
+    w_pc1 = st_module.session_state.get('w_pc1', 1.1)
+    w_cjump = st_module.session_state.get('w_cjump', 1.0)
+    w_vol = st_module.session_state.get('w_vol', 0.7)
+    w_credit = st_module.session_state.get('w_credit', 1.0)
+    w_covmag = st_module.session_state.get('w_covmag', 1.0)
+    w_decouple = st_module.session_state.get('w_decouple', 0.9)
+    alert_score_level = st_module.session_state.get('alert_score', 70.0)
+    alert_score_jump = st_module.session_state.get('alert_jump', 8.0)
+    alert_turb_pct = st_module.session_state.get('alert_turb', 0.90)
+    alert_corr_pct = st_module.session_state.get('alert_corr', 0.90)
+    
+    # Build config
+    universe = [t.strip().upper() for t in universe_input.split(",") if t.strip()]
+    # Always include VIX for implied vol
+    if "^VIX" not in universe:
+        universe.append("^VIX")
+    
+    cfg = TURB_DEFAULT_CONFIG.copy()
+    cfg.update({
+        'cov_window': cov_window,
+        'corr_window': corr_window,
+        'vol_window': vol_window,
+        'smooth': smooth,
+        'cov_mode': cov_mode,
+        'w_turb': w_turb,
+        'w_corr': w_corr,
+        'w_corr_jump': w_cjump,
+        'w_pc1': w_pc1,
+        'w_cov_mag': w_covmag,
+        'w_vol': w_vol,
+        'w_credit': w_credit,
+        'w_decouple': w_decouple,
+        'alert_score_level': alert_score_level,
+        'alert_score_jump_5d': alert_score_jump,
+        'alert_turb_pct': alert_turb_pct,
+        'alert_corr_pct': alert_corr_pct,
+    })
+    
+    # Fetch and compute
+    with st_module.spinner("Loading cross-asset price data..."):
+        prices = fetch_turbulence_prices(tuple(universe), period=data_period)
+    
+    if prices.empty or len(prices) < cfg['min_points']:
+        st_module.error(f"Insufficient data. Need at least {cfg['min_points']} trading days.")
+        return
+    
+    with st_module.spinner("Computing turbulence model (this may take a moment)..."):
+        result = compute_turbulence_model(prices.to_json(orient='split', date_format='iso'), cfg)
+    
+    if 'error' in result:
+        st_module.error(result['error'])
+        return
+    
+    # Deserialize results
+    metrics = pd.read_json(result['metrics'], orient='split')
+    metrics.index = pd.to_datetime(metrics.index)
+    diagnostics = pd.read_json(result['diagnostics'], orient='split')
+    diagnostics.index = pd.to_datetime(diagnostics.index)
+    
+    # Filter to valid data
+    m = metrics.dropna(subset=["RISK_TURBULENCE_SCORE"])
+    d = diagnostics.loc[m.index]
+    
+    if m.empty:
+        st_module.warning("Model computation returned no valid results. Try adjusting parameters or expanding the universe.")
+        return
+    
+    latest_m = m.iloc[-1]
+    latest_d = d.iloc[-1]
+    
+    score = float(latest_m["RISK_TURBULENCE_SCORE"])
+    regime = str(latest_m.get("REGIME", "N/A"))
+    chg_5d = float(latest_m["SCORE_5D_CHG"]) if pd.notna(latest_m.get("SCORE_5D_CHG")) else 0.0
+    chg_1m = float(latest_m["SCORE_1M_CHG"]) if pd.notna(latest_m.get("SCORE_1M_CHG")) else 0.0
+    
+    # Regime styling
+    regime_colors = {
+        "GREEN": ("#3fb950", "rgba(63,185,80,0.15)", "Normal / Diversified"),
+        "YELLOW": ("#d29922", "rgba(210,153,34,0.15)", "Tightening / Watch"),
+        "ORANGE": ("#f0883e", "rgba(240,136,62,0.15)", "Regime Shift Building"),
+        "RED": ("#f85149", "rgba(248,81,73,0.15)", "Turbulent / Correlation-to-1"),
+    }
+    r_color, r_bg, r_desc = regime_colors.get(regime, ("#8b949e", "rgba(139,148,158,0.15)", "Unknown"))
+    
+    # === ALERTS ===
+    alert_msg = str(latest_m.get("ALERTS", ""))
+    if alert_msg:
+        st_module.markdown(f"""
+        <div style="background: rgba(248,81,73,0.15); border: 2px solid #f85149; border-radius: 10px; padding: 1rem; margin-bottom: 1rem;">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <span style="font-size: 1.5rem;">🚨</span>
+                <div>
+                    <div style="color: #f85149; font-weight: 700; font-size: 1rem;">INSTITUTIONAL ALERT</div>
+                    <div style="color: #f0883e; font-size: 0.9rem;">{alert_msg}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # === KPI TILES ROW ===
+    st_module.markdown("#### 📊 Current Risk State")
+    kpi_cols = st_module.columns(5)
+    
+    with kpi_cols[0]:
+        score_color = r_color
+        st_module.markdown(f"""
+        <div class="metric-card" style="text-align: center; padding: 1rem; border-left: 4px solid {score_color};">
+            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Composite Score</div>
+            <div style="color: {score_color}; font-size: 2rem; font-weight: 700;">{score:.1f}</div>
+            <div style="color: {'#3fb950' if chg_5d <= 0 else '#f85149'}; font-size: 0.8rem;">{chg_5d:+.1f} (5d)</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with kpi_cols[1]:
+        st_module.markdown(f"""
+        <div class="metric-card" style="text-align: center; padding: 1rem; background: {r_bg}; border: 1px solid {r_color};">
+            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Regime</div>
+            <div style="color: {r_color}; font-size: 1.3rem; font-weight: 700;">{regime}</div>
+            <div style="color: #8b949e; font-size: 0.7rem;">{r_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with kpi_cols[2]:
+        chg_1m_color = '#3fb950' if chg_1m <= 0 else '#f85149'
+        st_module.markdown(f"""
+        <div class="metric-card" style="text-align: center; padding: 1rem;">
+            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">1-Month Change</div>
+            <div style="color: {chg_1m_color}; font-size: 1.8rem; font-weight: 700;">{chg_1m:+.1f}</div>
+            <div style="color: #8b949e; font-size: 0.75rem;">pts</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with kpi_cols[3]:
+        # Top driver
+        drivers = ["TURB_SCORE", "CORR_SCORE", "CORR_JUMP_SCORE", "PC1_SCORE", "COVMAG_SCORE", "VOL_SCORE", "CREDIT_SCORE", "DECOUPLE_SCORE"]
+        present = [k for k in drivers if k in m.columns and pd.notna(latest_m.get(k))]
+        if present:
+            top_driver = max(present, key=lambda k: float(latest_m[k]))
+            top_val = float(latest_m[top_driver])
+            top_name = top_driver.replace("_SCORE", "").replace("_", " ").title()
+        else:
+            top_name, top_val = "N/A", 0
+        st_module.markdown(f"""
+        <div class="metric-card" style="text-align: center; padding: 1rem;">
+            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Top Driver</div>
+            <div style="color: #58a6ff; font-size: 1rem; font-weight: 600;">{top_name}</div>
+            <div style="color: #c9d1d9; font-size: 1.2rem;">{top_val:.1f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with kpi_cols[4]:
+        dec = float(latest_d.get("DECOUPLE_0_1", 0))
+        dec_color = '#f85149' if dec > 0.7 else '#d29922' if dec > 0.5 else '#3fb950'
+        st_module.markdown(f"""
+        <div class="metric-card" style="text-align: center; padding: 1rem;">
+            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Decoupling (0-1)</div>
+            <div style="color: {dec_color}; font-size: 1.8rem; font-weight: 700;">{dec:.2f}</div>
+            <div style="color: #8b949e; font-size: 0.7rem;">{'⚠️ High' if dec > 0.7 else '🟡 Watch' if dec > 0.5 else '✅ Normal'}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # === MAIN CHART ===
+    st_module.markdown("#### 📈 Composite Score History")
+    
+    fig = go.Figure()
+    
+    # Add regime background bands
+    bands = [
+        (0, 35, "rgba(63,185,80,0.08)", "Green Zone"),
+        (35, 55, "rgba(210,153,34,0.08)", "Yellow Zone"),
+        (55, 70, "rgba(240,136,62,0.10)", "Orange Zone"),
+        (70, 100, "rgba(248,81,73,0.12)", "Red Zone"),
+    ]
+    for y0, y1, color, name in bands:
+        fig.add_shape(
+            type="rect",
+            x0=m.index.min(), x1=m.index.max(),
+            y0=y0, y1=y1,
+            fillcolor=color,
+            line=dict(width=0),
+            layer="below"
+        )
+    
+    # Main score line
+    fig.add_trace(go.Scatter(
+        x=m.index, y=m["RISK_TURBULENCE_SCORE"],
+        mode='lines',
+        name='Risk Score',
+        line=dict(color='#58a6ff', width=2),
+        fill='tozeroy',
+        fillcolor='rgba(88,166,255,0.1)'
+    ))
+    
+    # Add threshold lines
+    fig.add_hline(y=70, line_dash="dash", line_color="#f85149", annotation_text="Alert: 70", annotation_position="right")
+    fig.add_hline(y=35, line_dash="dash", line_color="#3fb950", annotation_text="Normal: 35", annotation_position="right")
+    
+    fig.update_layout(
+        template='plotly_dark',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(22,27,34,0.8)',
+        height=350,
+        margin=dict(l=10, r=10, t=30, b=10),
+        yaxis=dict(range=[0, 100], title="Score (0-100)"),
+        xaxis=dict(title=""),
+        showlegend=False,
+        font=dict(family='Inter, sans-serif', color='#8b949e', size=10)
+    )
+    st_module.plotly_chart(fig, use_container_width=True)
+    
+    # === DRIVER BREAKDOWN ===
+    st_module.markdown("#### 🎛️ Driver Scores (0-100)")
+    driver_cols = st_module.columns(4)
+    
+    driver_info = [
+        ("TURB_SCORE", "🌪️ Turbulence", "Mahalanobis distance"),
+        ("CORR_SCORE", "🔗 Correlation", "Avg abs correlation"),
+        ("CORR_JUMP_SCORE", "⚡ Corr Jump", "Correlation regime break"),
+        ("PC1_SCORE", "📊 PC1 Conc.", "Eigen concentration"),
+        ("COVMAG_SCORE", "📈 Cov Mag", "Covariance magnitude"),
+        ("VOL_SCORE", "📉 Real Vol", "Realized volatility"),
+        ("CREDIT_SCORE", "💳 Credit", "HY-IG spread stress"),
+        ("DECOUPLE_SCORE", "🔮 Decouple", "Calm-before-storm"),
+    ]
+    
+    for i, (key, label, desc) in enumerate(driver_info):
+        if key in m.columns and pd.notna(latest_m.get(key)):
+            val = float(latest_m[key])
+            val_color = '#f85149' if val > 65 else '#d29922' if val > 50 else '#3fb950'
+            with driver_cols[i % 4]:
+                st_module.markdown(f"""
+                <div style="background: rgba(33,38,45,0.5); border-radius: 8px; padding: 0.75rem; margin: 0.25rem 0; border-left: 3px solid {val_color};">
+                    <div style="color: #c9d1d9; font-size: 0.8rem; font-weight: 600;">{label}</div>
+                    <div style="color: {val_color}; font-size: 1.3rem; font-weight: 700;">{val:.1f}</div>
+                    <div style="color: #6e7681; font-size: 0.65rem;">{desc}</div>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # === COVARIANCE DIAGNOSTICS ===
+    st_module.markdown("#### 🔬 Covariance Regime Diagnostics (2Y Rolling Percentiles)")
+    diag_cols = st_module.columns(5)
+    
+    diag_metrics = [
+        ("TURB_PCT", "Turbulence", "vs 2Y history"),
+        ("CORR_PCT", "Correlation", "diversification breakdown"),
+        ("CJUMP_PCT", "Corr Jump", "regime break signal"),
+        ("PC1_PCT", "PC1 Share", "eigen concentration"),
+        ("COVMAG_PCT", "Cov Magnitude", "system-wide vol"),
+    ]
+    
+    for i, (key, label, desc) in enumerate(diag_metrics):
+        val = float(latest_d.get(key, 0)) * 100 if pd.notna(latest_d.get(key)) else 0
+        val_color = '#f85149' if val > 80 else '#d29922' if val > 60 else '#3fb950'
+        with diag_cols[i]:
+            st_module.markdown(f"""
+            <div class="metric-card" style="text-align: center; padding: 0.75rem;">
+                <div style="color: #8b949e; font-size: 0.65rem; text-transform: uppercase;">{label}</div>
+                <div style="color: {val_color}; font-size: 1.4rem; font-weight: 700;">{val:.0f}%</div>
+                <div style="color: #6e7681; font-size: 0.6rem;">{desc}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # === METHODOLOGY EXPANDER ===
+    with st_module.expander("📖 Methodology (Institutional, Explainable)", expanded=False):
+        st_module.markdown("""
+**Core Engine (What Makes This "Pro"):**
+
+- **Turbulence** is the Mahalanobis distance of today's cross-asset return vector versus a rolling mean and **robust covariance matrix**.
+- Covariance is estimated using **shrinkage**, **EWMA**, or a **blend** (default), improving stability and sensitivity to regime shifts.
+- Unlike simple VIX-based measures, this captures **cross-asset correlation structure changes**.
+
+**How We Detect "Risk Convergence":**
+
+| Signal | What It Measures | Why It Matters |
+|--------|------------------|----------------|
+| **Avg Abs Correlation** | Rising → diversification breaks | When correlations spike, hedges fail simultaneously |
+| **Corr-Jump Norm** | ‖Corr_t - Corr_{t-1}‖_F | Sudden correlation matrix shifts indicate regime breaks |
+| **PC1 Share** | First principal component's variance share | High = "one factor dominates" = correlation-to-1 crowding |
+| **Cov Magnitude** | Frobenius norm of covariance matrix | Entire system's covariance is inflating |
+| **Decoupling Score** | Corr rising while vol low + implied complacency | Classic "calm before storm" setup |
+
+**How to Use:**
+
+1. **GREEN (0-35):** Normal markets, diversification working. Standard risk-on positioning.
+2. **YELLOW (35-55):** Correlations tightening. Reduce leverage, tighten stops.
+3. **ORANGE (55-70):** Regime shift building. De-risk, add tail hedges.
+4. **RED (70+):** Turbulent / correlation-to-1 risk. Defensive positioning, consider cash.
+
+**Watch for:**
+- **5D Score Jump ≥8:** Rapid deterioration, possible forced deleveraging ahead
+- **Corr High + Vol Low:** "Calm before storm" — historically precedes volatility spikes
+- **PC1 Share spiking:** Market becoming "one-factor" (usually risk-on/risk-off)
+        """)
+    
+    # === RAW DIAGNOSTICS ===
+    with st_module.expander("📊 Raw Diagnostics (Last 60 Days)", expanded=False):
+        display_cols = [c for c in ["TURBULENCE", "AVG_ABS_CORR", "CORR_JUMP_NORM", "PC1_SHARE", "COV_FROBENIUS", "AVG_REALIZED_VOL", "CREDIT_SPREAD", "VIX", "DECOUPLE_0_1"] if c in d.columns]
+        st_module.dataframe(d[display_cols].tail(60).round(4), use_container_width=True, height=300)
+    
+    # === DRIVER HISTORY ===
+    with st_module.expander("📈 Driver History (Last 45 Days)", expanded=False):
+        driver_cols_display = [c for c in drivers if c in m.columns]
+        st_module.dataframe(m[driver_cols_display].tail(45).round(1), use_container_width=True, height=260)
 
 def get_market_status():
     eastern = pytz.timezone('US/Eastern')
@@ -1566,7 +2383,7 @@ def generate_expert_analysis(symbol, data, signals, support_levels, resistance_l
         momentum_factors.append(('RSI Neutral', 0, f'{rsi:.0f}'))
     
     # MACD Factor
-    macd_val, signal_val, macd_cond = calculate_macd(hist['Close'])
+    macd_val, signal_val, macd_hist, macd_cond = calculate_macd(hist['Close'])
     if macd_cond == 'bullish_cross':
         momentum_score += 20
         momentum_factors.append(('MACD Bullish Cross', +20, 'Fresh'))
@@ -4696,7 +5513,7 @@ def main():
         eastern = pytz.timezone('US/Eastern')
         st.markdown(f'<div style="text-align:right;"><span class="market-status status-{sk}">{st_txt}</span><p class="timestamp">{cd}</p><p class="timestamp">{datetime.now(eastern).strftime("%I:%M %p ET")}</p></div>', unsafe_allow_html=True)
     st.markdown("---")
-    tabs = st.tabs(["🎯 Market Brief", "🌍 Futures", "📊 Stocks", "🏢 Sectors", "📈 Options", "📅 Earnings", "🔍 Research"])
+    tabs = st.tabs(["🎯 Market Brief", "🌍 Futures", "📊 Stocks", "🏢 Sectors", "📈 Options", "📅 Earnings", "🌊 Turbulence", "🔍 Research"])
     
     with tabs[0]:
         st.markdown("## 🎯 Daily Intelligence")
@@ -5558,7 +6375,12 @@ def main():
                     except Exception as e:
                         st.error(f"Could not analyze the URL. Please check the link is valid and accessible. Error: {str(e)[:100]}")
     
+    # === TURBULENCE TAB ===
     with tabs[6]:
+        render_turbulence_tab(st)
+    
+    # === RESEARCH TAB ===
+    with tabs[7]:
         st.markdown("### 🔍 Research & URL Analysis")
         st.markdown("<p style='color: #8b949e; font-size: 0.85rem;'>Paste any financial news article URL for institutional-grade macro analysis</p>", unsafe_allow_html=True)
         
