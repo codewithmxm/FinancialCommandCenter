@@ -19,6 +19,18 @@ v8.4 Updates:
   * Institutional alerts for rapid deterioration
   * Color-coded regime bands (GREEN/YELLOW/ORANGE/RED)
 
+- BLOOMBERG TERMINAL-STYLE TRADE PARAMETERS UI
+  * Professional dark terminal aesthetic with monospace fonts
+  * Entry zone, stop loss, and multiple target levels
+  * Real-time risk/reward calculations
+  * Key breakout/breakdown level visualization
+  * Position size calculator with max loss/potential gain
+  * Color-coded bias indicators (LONG/SHORT/NEUTRAL)
+
+- FIXED: AI Expert Analysis now renders properly using st.columns()
+  * No more raw HTML/code display
+  * Clean card-based layout for verdict, metrics, and targets
+
 v8.3 Updates:
 - WORLD-CLASS AI Expert Analysis completely redesigned
 - All news articles now CLICKABLE with embedded links
@@ -35,7 +47,8 @@ Features:
 - 📈 Advanced Options Screener
 - 🎯 AI-generated institutional-grade analysis
 - 🧠 Smart Money indicators
-- 🌊 Risk Turbulence & Convergence Early Warning (NEW)
+- 🌊 Risk Turbulence & Convergence Early Warning
+- 💹 Bloomberg Terminal-style Trade Parameters
 """
 
 import streamlit as st
@@ -2740,6 +2753,27 @@ def generate_expert_analysis(symbol, data, signals, support_levels, resistance_l
 {trade_text}
 """.strip()
     
+    # Build structured trade parameters for Bloomberg-style UI
+    trade_params_structured = {
+        'bias': 'LONG' if position_bias in ['aggressive_long', 'long', 'cautious_long'] else 'SHORT' if position_bias in ['aggressive_short', 'short', 'cautious_short'] else 'NEUTRAL',
+        'bias_strength': 'AGGRESSIVE' if 'aggressive' in position_bias else 'CAUTIOUS' if 'cautious' in position_bias else 'STANDARD',
+        'entry_low': nearest_support[1] if nearest_support else price * 0.98,
+        'entry_high': price,
+        'stop_loss': (nearest_support[1] if nearest_support else price) * 0.97 if position_bias in ['aggressive_long', 'long', 'cautious_long'] else (nearest_resistance[1] if nearest_resistance else price) * 1.03,
+        'stop_pct': support_dist + 3 if position_bias in ['aggressive_long', 'long', 'cautious_long'] else resistance_dist + 3,
+        'target_1': upside_target,
+        'target_1_pct': upside_pct,
+        'target_2': target_high if target_high > upside_target else None,
+        'target_2_pct': safe_pct_change(target_high, price) if target_high > upside_target else None,
+        'position_size': 'REDUCED' if volatility_regime in ['high', 'elevated'] else 'STANDARD',
+        'breakout_level': nearest_resistance[1] if nearest_resistance else price * 1.02,
+        'breakdown_level': nearest_support[1] if nearest_support else price * 0.98,
+        'current_price': price,
+        'atr_stop': price - (atr_value * 2) if position_bias in ['aggressive_long', 'long', 'cautious_long'] else price + (atr_value * 2),
+        'risk_per_share': abs(price - ((nearest_support[1] if nearest_support else price) * 0.97)),
+        'reward_per_share': abs(upside_target - price),
+    }
+    
     return {
         'verdict': verdict,
         'verdict_color': verdict_color,
@@ -2766,7 +2800,8 @@ def generate_expert_analysis(symbol, data, signals, support_levels, resistance_l
         'smart_money_score': smart_money_score,
         'squeeze_potential': squeeze_potential,
         'exec_summary': exec_summary,
-        'trade_params': trade_text
+        'trade_params': trade_text,
+        'trade_params_structured': trade_params_structured
     }
 
 def analyze_news_sentiment(news_items):
@@ -4330,86 +4365,334 @@ def render_stock_report(symbol):
     
     # === WORLD-CLASS EXPERT ANALYSIS SECTION ===
     if expert:
-        # Main Verdict Card
+        # Pre-calculate all values to avoid inline conditionals in HTML
         verdict_bg = '#1a2e1a' if 'BUY' in expert['verdict'] else '#2e1a1a' if 'SELL' in expert['verdict'] else '#1a1a2e'
+        verdict_color = expert['verdict_color']
+        verdict_icon = expert.get('verdict_icon', '📊')
+        verdict_text = expert['verdict']
+        overall_score = expert.get('overall_score', expert['tech_score'])
         
-        st.markdown(f"""
-        <div style="background: linear-gradient(145deg, {verdict_bg} 0%, #161b22 100%); border: 1px solid {expert['verdict_color']}; border-radius: 12px; padding: 1.5rem; margin: 1.5rem 0;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                <div>
-                    <div style="font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.25rem;">AI Institutional Analysis</div>
-                    <div style="font-size: 2.5rem; font-weight: 700; color: {expert['verdict_color']}; line-height: 1;">{expert.get('verdict_icon', '📊')} {expert['verdict']}</div>
-                </div>
-                <div style="text-align: right;">
-                    <div style="font-size: 0.7rem; color: #8b949e; text-transform: uppercase;">Composite Score</div>
-                    <div style="font-size: 2rem; font-weight: 600; color: {expert['verdict_color']};">{expert.get('overall_score', expert['tech_score']):+d}</div>
-                </div>
-            </div>
-            
-            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem;">
-                <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; text-align: center;">
-                    <div style="font-size: 1.2rem; font-weight: 600; color: {'#3fb950' if expert.get('rsi', 50) < 70 and expert.get('rsi', 50) > 30 else '#f85149'};">{expert.get('rsi', 50):.0f}</div>
-                    <div style="font-size: 0.65rem; color: #8b949e;">RSI</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; text-align: center;">
-                    <div style="font-size: 1.2rem; font-weight: 600; color: {'#3fb950' if expert.get('vol_ratio', 1) > 1 else '#8b949e'};">{expert.get('vol_ratio', 1):.1f}x</div>
-                    <div style="font-size: 0.65rem; color: #8b949e;">Vol Ratio</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; text-align: center;">
-                    <div style="font-size: 1.2rem; font-weight: 600; color: {'#3fb950' if expert.get('risk_reward', 0) > 1.5 else '#d29922' if expert.get('risk_reward', 0) > 1 else '#f85149'};">{expert.get('risk_reward', 0):.1f}:1</div>
-                    <div style="font-size: 0.65rem; color: #8b949e;">Risk/Reward</div>
-                </div>
-                <div style="background: rgba(0,0,0,0.2); padding: 0.75rem; border-radius: 8px; text-align: center;">
-                    <div style="font-size: 1.2rem; font-weight: 600; color: {'#f85149' if expert.get('volatility_regime') == 'high' else '#d29922' if expert.get('volatility_regime') == 'elevated' else '#3fb950'};">{expert.get('volatility_regime', 'normal').upper()[:4]}</div>
-                    <div style="font-size: 0.65rem; color: #8b949e;">Volatility</div>
-                </div>
-            </div>
-            
-            <div style="background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
-                <div style="font-size: 0.9rem; color: #c9d1d9; line-height: 1.6;">{expert.get('exec_summary', '')}</div>
-            </div>
-            
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                <div style="background: rgba(0,200,5,0.1); border: 1px solid rgba(0,200,5,0.3); padding: 0.75rem; border-radius: 8px;">
-                    <div style="font-size: 0.65rem; color: #3fb950; text-transform: uppercase; margin-bottom: 0.25rem;">Upside Target</div>
-                    <div style="font-size: 1.3rem; font-weight: 600; color: #3fb950;">${expert.get('upside_target', 0):.2f}</div>
-                    <div style="font-size: 0.75rem; color: #8b949e;">+{expert.get('upside_pct', 0):.1f}% potential</div>
-                </div>
-                <div style="background: rgba(255,59,48,0.1); border: 1px solid rgba(255,59,48,0.3); padding: 0.75rem; border-radius: 8px;">
-                    <div style="font-size: 0.65rem; color: #f85149; text-transform: uppercase; margin-bottom: 0.25rem;">Downside Risk</div>
-                    <div style="font-size: 1.3rem; font-weight: 600; color: #f85149;">${expert.get('downside_target', 0):.2f}</div>
-                    <div style="font-size: 0.75rem; color: #8b949e;">{expert.get('downside_pct', 0):.1f}% risk</div>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        rsi_val = expert.get('rsi', 50)
+        rsi_color = '#3fb950' if 30 < rsi_val < 70 else '#f85149'
         
-        # Detailed Analysis Expandable Section
-        with st.expander("📋 Full Institutional Analysis Report", expanded=True):
-            # Convert markdown to HTML-safe format
-            analysis_html = expert['text'].replace('\n\n', '</p><p style="margin: 0.75rem 0; color: #c9d1d9; line-height: 1.6;">').replace('\n', '<br>').replace('**', '</b>').replace('**', '<b>')
-            
-            # Render the full analysis with proper formatting
+        vol_ratio = expert.get('vol_ratio', 1)
+        vol_color = '#3fb950' if vol_ratio > 1 else '#8b949e'
+        
+        risk_reward = expert.get('risk_reward', 0)
+        rr_color = '#3fb950' if risk_reward > 1.5 else '#d29922' if risk_reward > 1 else '#f85149'
+        
+        vol_regime = expert.get('volatility_regime', 'normal')
+        vol_regime_color = '#f85149' if vol_regime == 'high' else '#d29922' if vol_regime == 'elevated' else '#3fb950'
+        vol_regime_text = vol_regime.upper()[:4]
+        
+        exec_summary = expert.get('exec_summary', '')
+        upside_target = expert.get('upside_target', 0)
+        upside_pct = expert.get('upside_pct', 0)
+        downside_target = expert.get('downside_target', 0)
+        downside_pct = expert.get('downside_pct', 0)
+        
+        # Render main verdict card using Streamlit components for reliability
+        st.markdown("### 🤖 AI Institutional Analysis")
+        
+        # Verdict header row
+        v_col1, v_col2 = st.columns([3, 1])
+        with v_col1:
             st.markdown(f"""
-            <div style="background: rgba(22,27,34,0.5); border-radius: 8px; padding: 1.25rem;">
-                <p style="margin: 0.75rem 0; color: #c9d1d9; line-height: 1.6;">{analysis_html}</p>
+            <div style="background: linear-gradient(145deg, {verdict_bg} 0%, #161b22 100%); border: 1px solid {verdict_color}; border-radius: 12px; padding: 1.25rem;">
+                <div style="font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.25rem;">Verdict</div>
+                <div style="font-size: 2rem; font-weight: 700; color: {verdict_color}; line-height: 1;">{verdict_icon} {verdict_text}</div>
             </div>
             """, unsafe_allow_html=True)
+        with v_col2:
+            st.markdown(f"""
+            <div style="background: rgba(22,27,34,0.8); border: 1px solid #30363d; border-radius: 12px; padding: 1.25rem; text-align: center;">
+                <div style="font-size: 0.7rem; color: #8b949e; text-transform: uppercase;">Score</div>
+                <div style="font-size: 2rem; font-weight: 700; color: {verdict_color};">{overall_score:+d}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Key metrics row using st.columns
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.markdown(f"""
+            <div style="background: rgba(22,27,34,0.5); border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 1.4rem; font-weight: 600; color: {rsi_color};">{rsi_val:.0f}</div>
+                <div style="font-size: 0.7rem; color: #8b949e;">RSI</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with m_col2:
+            st.markdown(f"""
+            <div style="background: rgba(22,27,34,0.5); border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 1.4rem; font-weight: 600; color: {vol_color};">{vol_ratio:.1f}x</div>
+                <div style="font-size: 0.7rem; color: #8b949e;">Vol Ratio</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with m_col3:
+            st.markdown(f"""
+            <div style="background: rgba(22,27,34,0.5); border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 1.4rem; font-weight: 600; color: {rr_color};">{risk_reward:.1f}:1</div>
+                <div style="font-size: 0.7rem; color: #8b949e;">Risk/Reward</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with m_col4:
+            st.markdown(f"""
+            <div style="background: rgba(22,27,34,0.5); border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 1.4rem; font-weight: 600; color: {vol_regime_color};">{vol_regime_text}</div>
+                <div style="font-size: 0.7rem; color: #8b949e;">Volatility</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Executive summary
+        if exec_summary:
+            st.markdown(f"""
+            <div style="background: rgba(22,27,34,0.5); border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin: 0.75rem 0;">
+                <div style="font-size: 0.9rem; color: #c9d1d9; line-height: 1.6;">{exec_summary}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Price targets row
+        t_col1, t_col2 = st.columns(2)
+        with t_col1:
+            st.markdown(f"""
+            <div style="background: rgba(0,200,5,0.1); border: 1px solid rgba(0,200,5,0.3); border-radius: 8px; padding: 0.75rem;">
+                <div style="font-size: 0.7rem; color: #3fb950; text-transform: uppercase; margin-bottom: 0.25rem;">📈 Upside Target</div>
+                <div style="font-size: 1.5rem; font-weight: 700; color: #3fb950;">${upside_target:.2f}</div>
+                <div style="font-size: 0.8rem; color: #8b949e;">+{upside_pct:.1f}% potential</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with t_col2:
+            st.markdown(f"""
+            <div style="background: rgba(255,59,48,0.1); border: 1px solid rgba(255,59,48,0.3); border-radius: 8px; padding: 0.75rem;">
+                <div style="font-size: 0.7rem; color: #f85149; text-transform: uppercase; margin-bottom: 0.25rem;">📉 Downside Risk</div>
+                <div style="font-size: 1.5rem; font-weight: 700; color: #f85149;">${downside_target:.2f}</div>
+                <div style="font-size: 0.8rem; color: #8b949e;">{downside_pct:.1f}% risk</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Detailed Analysis Expandable Section
+        with st.expander("📋 Full Institutional Analysis Report", expanded=False):
+            # Parse the analysis text properly
+            analysis_text = expert.get('text', '')
+            # Split by double newlines for paragraphs
+            paragraphs = analysis_text.split('\n\n')
+            for para in paragraphs:
+                if para.strip():
+                    # Handle bold markers
+                    formatted_para = para.replace('**', '<strong>').replace('**', '</strong>')
+                    # Fix any unclosed strong tags
+                    strong_count = formatted_para.count('<strong>')
+                    close_count = formatted_para.count('</strong>')
+                    if strong_count > close_count:
+                        formatted_para += '</strong>' * (strong_count - close_count)
+                    st.markdown(f"""
+                    <div style="margin-bottom: 0.75rem; color: #c9d1d9; line-height: 1.6; font-size: 0.9rem;">
+                        {formatted_para.replace(chr(10), '<br>')}
+                    </div>
+                    """, unsafe_allow_html=True)
         
         # Momentum Factors Breakdown
         if expert.get('momentum_factors'):
             with st.expander("📊 Momentum Factor Breakdown", expanded=False):
                 for factor_name, factor_score, factor_value in expert['momentum_factors']:
                     score_color = '#3fb950' if factor_score > 0 else '#f85149' if factor_score < 0 else '#8b949e'
+                    score_sign = '+' if factor_score > 0 else ''
                     st.markdown(f"""
                     <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid rgba(48,54,61,0.5);">
                         <span style="color: #c9d1d9;">{factor_name}</span>
                         <div>
                             <span style="color: #8b949e; margin-right: 1rem;">{factor_value}</span>
-                            <span style="color: {score_color}; font-weight: 600;">{factor_score:+d}</span>
+                            <span style="color: {score_color}; font-weight: 600;">{score_sign}{factor_score}</span>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
+        
+        # === BLOOMBERG TERMINAL-STYLE TRADE PARAMETERS ===
+        trade_struct = expert.get('trade_params_structured', {})
+        if trade_struct:
+            st.markdown("### 💹 Trade Parameters")
+            
+            # Get values
+            bias = trade_struct.get('bias', 'NEUTRAL')
+            bias_strength = trade_struct.get('bias_strength', 'STANDARD')
+            current_price = trade_struct.get('current_price', 0)
+            entry_low = trade_struct.get('entry_low', 0)
+            entry_high = trade_struct.get('entry_high', 0)
+            stop_loss = trade_struct.get('stop_loss', 0)
+            stop_pct = trade_struct.get('stop_pct', 0)
+            target_1 = trade_struct.get('target_1', 0)
+            target_1_pct = trade_struct.get('target_1_pct', 0)
+            target_2 = trade_struct.get('target_2')
+            target_2_pct = trade_struct.get('target_2_pct')
+            position_size = trade_struct.get('position_size', 'STANDARD')
+            breakout = trade_struct.get('breakout_level', 0)
+            breakdown = trade_struct.get('breakdown_level', 0)
+            risk_per_share = trade_struct.get('risk_per_share', 0)
+            reward_per_share = trade_struct.get('reward_per_share', 0)
+            rr_ratio = expert.get('risk_reward', 0)
+            
+            # Bias colors
+            bias_color = '#00ff41' if bias == 'LONG' else '#ff3b30' if bias == 'SHORT' else '#ffcc00'
+            bias_bg = 'rgba(0,255,65,0.15)' if bias == 'LONG' else 'rgba(255,59,48,0.15)' if bias == 'SHORT' else 'rgba(255,204,0,0.15)'
+            
+            # Terminal header
+            st.markdown(f"""
+            <div style="background: #0a0a0a; border: 1px solid #333; border-radius: 4px; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; overflow: hidden;">
+                <!-- Terminal Title Bar -->
+                <div style="background: linear-gradient(90deg, #1a1a2e 0%, #16213e 100%); padding: 0.5rem 1rem; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center;">
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                        <span style="color: #ff9500; font-weight: 700; font-size: 0.9rem;">◆ TRADE SETUP</span>
+                        <span style="color: #666; font-size: 0.75rem;">|</span>
+                        <span style="color: {bias_color}; font-weight: 700; font-size: 1.1rem;">{bias}</span>
+                        <span style="background: {bias_bg}; color: {bias_color}; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.7rem; font-weight: 600;">{bias_strength}</span>
+                    </div>
+                    <div style="color: #666; font-size: 0.7rem;">
+                        {symbol} • ${current_price:.2f}
+                    </div>
+                </div>
+                
+                <!-- Main Terminal Content -->
+                <div style="padding: 1rem; background: #0d1117;">
+                    <!-- Entry Zone Row -->
+                    <div style="display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 0.75rem; align-items: center;">
+                        <div style="color: #666; font-size: 0.75rem; text-transform: uppercase;">Entry Zone</div>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <span style="color: #00ff41; font-size: 1.1rem; font-weight: 600;">${entry_low:.2f}</span>
+                            <span style="color: #444;">—</span>
+                            <span style="color: #00ff41; font-size: 1.1rem; font-weight: 600;">${entry_high:.2f}</span>
+                            <span style="color: #444; font-size: 0.7rem; margin-left: 0.5rem;">▼ BUY ZONE</span>
+                        </div>
+                    </div>
+                    
+                    <!-- Divider -->
+                    <div style="border-top: 1px solid #222; margin: 0.75rem 0;"></div>
+                    
+                    <!-- Stop Loss Row -->
+                    <div style="display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center;">
+                        <div style="color: #ff3b30; font-size: 0.75rem; text-transform: uppercase;">⛔ Stop Loss</div>
+                        <div style="display: flex; align-items: center; gap: 1rem;">
+                            <span style="color: #ff3b30; font-size: 1.1rem; font-weight: 700;">${stop_loss:.2f}</span>
+                            <span style="background: rgba(255,59,48,0.2); color: #ff6b6b; padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.75rem;">-{stop_pct:.1f}%</span>
+                            <span style="color: #444; font-size: 0.7rem;">RISK: ${risk_per_share:.2f}/share</span>
+                        </div>
+                    </div>
+                    
+                    <!-- Target 1 Row -->
+                    <div style="display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center;">
+                        <div style="color: #00ff41; font-size: 0.75rem; text-transform: uppercase;">🎯 Target 1</div>
+                        <div style="display: flex; align-items: center; gap: 1rem;">
+                            <span style="color: #00ff41; font-size: 1.1rem; font-weight: 700;">${target_1:.2f}</span>
+                            <span style="background: rgba(0,255,65,0.2); color: #4ade80; padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.75rem;">+{target_1_pct:.1f}%</span>
+                            <span style="color: #444; font-size: 0.7rem;">REWARD: ${reward_per_share:.2f}/share</span>
+                        </div>
+                    </div>
+                    
+                    {"" if not target_2 else f'''
+                    <!-- Target 2 Row -->
+                    <div style="display: grid; grid-template-columns: 120px 1fr; gap: 0.5rem; margin-bottom: 0.5rem; align-items: center;">
+                        <div style="color: #00d4ff; font-size: 0.75rem; text-transform: uppercase;">🚀 Target 2</div>
+                        <div style="display: flex; align-items: center; gap: 1rem;">
+                            <span style="color: #00d4ff; font-size: 1.1rem; font-weight: 700;">${target_2:.2f}</span>
+                            <span style="background: rgba(0,212,255,0.2); color: #67e8f9; padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.75rem;">+{target_2_pct:.1f}%</span>
+                            <span style="color: #444; font-size: 0.7rem;">EXTENDED TARGET</span>
+                        </div>
+                    </div>
+                    '''}
+                    
+                    <!-- Divider -->
+                    <div style="border-top: 1px solid #222; margin: 0.75rem 0;"></div>
+                    
+                    <!-- Key Levels Row -->
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 0.75rem;">
+                        <div style="background: rgba(255,59,48,0.1); border: 1px solid rgba(255,59,48,0.3); border-radius: 4px; padding: 0.5rem 0.75rem;">
+                            <div style="color: #666; font-size: 0.65rem; text-transform: uppercase;">Breakdown Level</div>
+                            <div style="color: #ff6b6b; font-size: 1rem; font-weight: 600;">${breakdown:.2f}</div>
+                        </div>
+                        <div style="background: rgba(0,255,65,0.1); border: 1px solid rgba(0,255,65,0.3); border-radius: 4px; padding: 0.5rem 0.75rem;">
+                            <div style="color: #666; font-size: 0.65rem; text-transform: uppercase;">Breakout Level</div>
+                            <div style="color: #4ade80; font-size: 1rem; font-weight: 600;">${breakout:.2f}</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Bottom Stats Bar -->
+                    <div style="background: #161b22; border-radius: 4px; padding: 0.75rem; display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; text-align: center;">
+                        <div>
+                            <div style="color: #666; font-size: 0.6rem; text-transform: uppercase;">R:R Ratio</div>
+                            <div style="color: {'#00ff41' if rr_ratio >= 2 else '#ffcc00' if rr_ratio >= 1.5 else '#ff6b6b'}; font-size: 1.1rem; font-weight: 700;">{rr_ratio:.1f}:1</div>
+                        </div>
+                        <div>
+                            <div style="color: #666; font-size: 0.6rem; text-transform: uppercase;">Position Size</div>
+                            <div style="color: {'#ffcc00' if position_size == 'REDUCED' else '#00ff41'}; font-size: 0.9rem; font-weight: 600;">{position_size}</div>
+                        </div>
+                        <div>
+                            <div style="color: #666; font-size: 0.6rem; text-transform: uppercase;">Volatility</div>
+                            <div style="color: {vol_regime_color}; font-size: 0.9rem; font-weight: 600;">{vol_regime.upper()}</div>
+                        </div>
+                        <div>
+                            <div style="color: #666; font-size: 0.6rem; text-transform: uppercase;">Signal</div>
+                            <div style="color: {verdict_color}; font-size: 0.9rem; font-weight: 600;">{verdict_text}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Terminal Footer -->
+                <div style="background: #0a0a0a; border-top: 1px solid #222; padding: 0.4rem 1rem; display: flex; justify-content: space-between; align-items: center;">
+                    <div style="color: #444; font-size: 0.65rem;">
+                        <span style="color: #ff9500;">●</span> AI INSTITUTIONAL ANALYSIS
+                    </div>
+                    <div style="color: #444; font-size: 0.65rem;">
+                        Updated: {datetime.now().strftime('%H:%M:%S')} ET
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Position Calculator (collapsible)
+            with st.expander("🧮 Position Size Calculator", expanded=False):
+                calc_cols = st.columns(3)
+                with calc_cols[0]:
+                    account_size = st.number_input("Account Size ($)", value=100000, step=10000, key="pos_calc_acct")
+                with calc_cols[1]:
+                    risk_pct = st.number_input("Risk Per Trade (%)", value=1.0, step=0.25, min_value=0.25, max_value=5.0, key="pos_calc_risk")
+                with calc_cols[2]:
+                    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                    if st.button("Calculate", key="calc_pos_btn", use_container_width=True):
+                        pass
+                
+                # Calculate position
+                risk_amount = account_size * (risk_pct / 100)
+                if risk_per_share > 0:
+                    shares = int(risk_amount / risk_per_share)
+                    position_value = shares * current_price
+                    max_loss = shares * risk_per_share
+                    potential_gain = shares * reward_per_share
+                else:
+                    shares = 0
+                    position_value = 0
+                    max_loss = 0
+                    potential_gain = 0
+                
+                st.markdown(f"""
+                <div style="background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-top: 0.5rem;">
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; text-align: center;">
+                        <div>
+                            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Shares</div>
+                            <div style="color: #58a6ff; font-size: 1.3rem; font-weight: 700;">{shares:,}</div>
+                        </div>
+                        <div>
+                            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Position Value</div>
+                            <div style="color: #c9d1d9; font-size: 1.3rem; font-weight: 700;">${position_value:,.0f}</div>
+                        </div>
+                        <div>
+                            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Max Loss</div>
+                            <div style="color: #f85149; font-size: 1.3rem; font-weight: 700;">-${max_loss:,.0f}</div>
+                        </div>
+                        <div>
+                            <div style="color: #8b949e; font-size: 0.7rem; text-transform: uppercase;">Potential Gain</div>
+                            <div style="color: #3fb950; font-size: 1.3rem; font-weight: 700;">+${potential_gain:,.0f}</div>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
     
     st.markdown("---")
     
